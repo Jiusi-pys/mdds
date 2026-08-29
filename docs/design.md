@@ -1,6 +1,7 @@
 # mdds 设计文档
 
-> 状态：v2（阶段二：扩展 QoS 已落地；本版已逐条核对 src/ 现行实现并修正）
+> 状态：v3（阶段四：精确 NACK/GAP 可靠性补全 + 发送 lane + QoS 预设；
+> 本版已逐条核对 src/ 现行实现并修正）
 >
 > mdds 是以 OpenHarmony DSoftBus 为跨设备传输基座的 ROS 2 中间件传输层。
 > DSoftBus 仅作为**透明 Bytes 字节管道**（Socket API，`DATA_TYPE_BYTES`），
@@ -23,9 +24,10 @@ mdds core           ros2/src/ros2/mdds       — 平台无关：帧编解码、�
 关键约束（来自 DSoftBus 源码事实）：
 
 - 一次 `SendBytes` 对应对端一次完整 `OnBytes`，管道保序、可靠、加密——mdds 不做 CRC/重排序。
-- 单包上限：TCP Direct 默认 4 MB，Proxy/BR 通道 4 KB 级 → mdds 必须自分片，
-  分片粒度按保守值切（`kDefaultMaxPayload = 3800`，dsoftbus 后端 `max_payload()` 恒定
-  返回该值；`GetSessionOption` 探测放大是代码注释中标注的待做优化，未实现）。
+- 单包上限：TCP Direct 默认 4 MB，Proxy/BR 通道 4 KB 级 → mdds 必须自分片。
+  dsoftbus 后端在通道建立时用 `GetSessionOption(SESSION_OPTION_MAX_SENDBYTES_SIZE)`
+  探测该通道的真实上限作为 `max_payload()`（分片粒度跟随链路能力）；探测失败回退
+  保守值 `kDefaultMaxPayload = 3800`。
 - 每进程 socket 上限 15 个 → 每 peer 一条全双工 socket，v1 支持的对端数受限（记录为已知限制）。
 - 无多播 → 发现依赖 LNN 组网枚举 + 逐 peer 连接。
 - DSoftBus 只在 OpenHarmony 运行 → 非 OHOS 设备互通由 mdds_gateway（阶段三）解决。
@@ -48,30 +50,43 @@ mdds core           ros2/src/ros2/mdds       — 平台无关：帧编解码、�
   向 LNN 组网内每个在线 peer 的同名 socket 发起 `BindAsync`（失败由下轮轮询重试）。
 - 连接建立后双向收发，一 peer 一条 socket。`OnShutdown` → 视该 peer 下线，清除其全部远端端点。
 - 同设备多进程：`transport_udp`（127.0.0.1）承载，避免占用 socket 配额与同机 session 不确定性。
+- **发送 lane（dsoftbus 后端）**：每个已连接 peer 一条 `SendLane`（`src/send_lane.hpp`）——
+  有界字节队列 + 专属 worker 线程。`Transport::send()` 只入队拷贝、立即返回，**绝不在
+  DSoftBus 回调线程上做网络 IO**（OnBytes 回调里触发的 ACKNACK/重传同样只入队）。
+  背压由双重字节预算承载：每 lane 8 MiB + 全 transport 共享 32 MiB；预算满则**丢新帧**并计数
+  （`SendLane::dropped()`），语义等同网络丢包——reliable 配对由 ACKNACK/GAP 自愈，
+  best_effort 直接丢失。lane 随通道生灭：`OnShutdown` 丢弃该 peer 残余队列；
+  worker 做 `SendBytes` 前在锁内复核 (peer, fd) 仍为当前通道（pin & touch 的简化版），
+  IO 本身不持锁。UDP loopback 后端保持同步 `sendto` 直发（本机内核管道，无慢对端风险）。
 
-## 4. 帧格式 v2
+## 4. 帧格式 v3
 
 所有多字节字段为网络字节序（big-endian）。一次 mdds 帧 = 一次 `SendBytes` 调用。
-v2 相对 v1 的唯一变化：DATA / DATA_FRAG body 增加 `pub_time_ms`（lifespan 支持），
-version 字段升为 2，v1/v2 不互通（gateway 转发无需转换，帧体原样透传即可）。
+v3 相对 v2 的变化：DATA / DATA_FRAG body 增加显式 `payload_len`，体尾可挂 TLV 扩展
+（网关防环预留 originGuid/originSeq）；flags 启用 `kFlagReliable`；新增 GAP 帧。
+version 字段升为 3，v2/v3 不互通（延续 v1→v2 立场；gateway 转发无需转换，帧体原样透传）。
 
 公共头（12 B）：
 
 | 偏移 | 字段 | 说明 |
 |---|---|---|
 | 0 | char magic[4] | `"MDDS"` |
-| 4 | uint8 version | = 2 |
-| 5 | uint8 frame_type | 1=DATA, 2=DATA_FRAG, 3=ACKNACK, 4=HEARTBEAT, 5=ANNOUNCE |
-| 6 | uint16 flags | 保留，置 0 |
+| 4 | uint8 version | = 3 |
+| 5 | uint8 frame_type | 1=DATA, 2=DATA_FRAG, 3=ACKNACK, 4=HEARTBEAT, 5=ANNOUNCE, 6=GAP |
+| 6 | uint16 flags | bit0 `kFlagReliable`：来自 RELIABLE writer 的 DATA/DATA_FRAG（重传与首发同置） |
 | 8 | uint32 body_len | 帧头之后的 body 长度 |
 
-DATA body（32 + N B）：
-`writer_guid(16) | seq:uint64 | pub_time_ms:uint64 | payload(N)`，payload 为 CDR 序列化样本。
+DATA body（36 + N + T B）：
+`writer_guid(16) | seq:uint64 | pub_time_ms:uint64 | payload_len:uint32 | payload(N) | trailer TLV(T)`。
+payload 为 CDR 序列化样本；`payload_len` 把载荷与体尾 TLV 分开，解码器对未知/截断 TLV
+容忍跳过（不丢 payload）。已定义 TLV（type:u8 | len:u8 | value）：
+`kTlvOriginGuid=1`（16 B）、`kTlvOriginSeq=2`（8 B）——网关跨域转发时保留原始身份用，
+当前无生产者/消费者（阶段五预留）。
 `pub_time_ms` = writer 写出时刻的 system_clock 毫秒（跨设备时钟不严格同步，仅作 lifespan
 相对时长参考；时钟偏差过大时 lifespan 判定会相应偏移——记录为已知限制）。
 
-DATA_FRAG body（40 + N B）：
-`writer_guid(16) | seq:uint64 | pub_time_ms:uint64 | total_size:uint32 | frag_offset:uint32 | frag_payload(N)`。
+DATA_FRAG body（44 + N + T B）：
+`writer_guid(16) | seq:uint64 | pub_time_ms:uint64 | total_size:uint32 | frag_offset:uint32 | frag_len:uint32 | frag_payload(N) | trailer TLV(T)`。
 同一样本的所有分片带相同 `pub_time_ms`。同一 (writer_guid, seq) 的分片在接收方重组
 （`Reassembler`，按已合并字节区间判定完成）；乱序到达允许（重传场景）。
 `Reassembler::sweep_expired()`（默认 5 s 超时丢弃）由 participant 主循环每个
@@ -80,11 +95,23 @@ announce tick 周期调用（`sweep_reassemblers_locked()`）；peer 下线时�
 
 ACKNACK body（48 B）：
 `reader_guid(16) | writer_guid(16) | base_seq:uint64 | bitmap:uint64`。
-bitmap 第 i 位表示 seq = base_seq + i 已收到。**无周期 ACKNACK 定时器**，仅两处触发：
+bitmap 第 i 位表示 seq = base_seq + i **已收到**（精确 NACK，v3 起生效）——writer 侧
+按位扫描 [base, base+63]，只补发 bitmap 未置位的 seq，已在窗口里的乱序样本不再重发。
+**无周期 ACKNACK 定时器**，仅两处触发：
 reader 在数据到达时检出 reliable 配对的 seq 空洞（`deliver_sample` 立即发送），以及
-收到 HEARTBEAT 发现自身落后（`handle_heartbeat`）；当前实现发出的 ACKNACK bitmap
-恒为 0（语义为「base_seq 起全部缺失」），writer 侧按位扫描 [base, base+63] 补发，
-bitmap 语义为将来精确 NACK 保留。
+收到 HEARTBEAT 发现自身落后（`handle_heartbeat`，base = 自身基线 +1，bitmap = 接收窗口快照）。
+
+GAP body（32 B）：`writer_guid(16) | gap_start:uint64 | gap_end:uint64`（闭区间）。
+writer 在 ACKNACK 请求的 seq 已从历史缓存驱逐（`seq < first_avail`）时回复 GAP，
+宣告该区间**永不重传**；reader 的 `apply_gap` 把基线推过 gap_end，
+窗口已收位不算丢失，其余按丢失计一次（`messages_lost`），NACK 循环就此终止。
+writer 侧 volatile reader 的 join 水位线（`reader_join_seq_`）优先于 GAP 判定：
+join 之前的 seq 既不重传也不 GAP（晚加入的 volatile reader 不会拉取加入前的历史）。
+
+reader 接收窗口：每 writer 一个 64 位 bitmap 跟踪 `(last_seq, last_seq+64]` 的乱序到达；
+重复样本（含 apply_gap 滑窗后迟到的重传）按位去重；offset ≥ 64 的跳变直接计丢失并跳基线
+（超出窗口的洞无法 NACK 治愈）。**丢失只在 GAP 到达或窗口跳变时计数**，
+检出空洞本身不计（可能被重传治愈，见 RetransmitHealsDroppedFrame 测试）。
 
 HEARTBEAT body（32 B）：`writer_guid(16) | first_seq:uint64 | last_seq:uint64`。
 周期发送与 ANNOUNCE 共用 `announce_period_ms`（默认 2000 ms），由 `announce_loop`
@@ -114,19 +141,33 @@ string = uint16 长度 + UTF-8 字节。qos 32 B 编码：
 
 ## 5. QoS 语义（mdds 层）
 
-阶段一（已板上验证）：
+阶段一（已板上验证，v3 起发送路径改道 lane，见 §3）：
 
-- **best_effort**：不缓存历史、不重传；发送路径无排队层，`SendBytes`/`sendto` 同步直发，
-  失败（通道拥塞 / 对端下线）即丢，`write()` 对该 peer 计失败。
+- **best_effort**：不缓存历史、不重传；dsoftbus 后端经 send lane 异步发送
+  （UDP loopback 仍同步 `sendto` 直发）；lane 预算满或通道失败即丢（丢新帧），
+  对 `write()` 表现为该 peer 发送失败/入队失败。
 - **reliable + keep_last(depth)**：
-  - writer 历史缓存保留最近 depth 条样本（KEEP_ALL 时 cap 为 `kKeepAllCap = 256`）；
-    阶段一仅服务重传，阶段二起亦服务 transient_local 补发（见下）。
-  - 底层管道保序可靠，正常情况下无丢失；丢失只发生在 socket 断连重连窗口。
-    重连后 HEARTBEAT/ACKNACK 对齐 seq 基线，空洞由 writer 重传补齐（缓存已覆盖则丢，记丢失统计）。
-  - reader 按 writer 维序：expected_seq 之前的重复样本丢弃（去重，gateway 防环也依赖此）。
+  - writer 历史缓存保留最近 depth 条样本；**KEEP_ALL 时 cap 为 `kKeepAllCap = 256`，
+    缓存满时 `write()` 直接返回 false**（KEEP_ALL 语义不可协商，不静默驱逐最旧样本；
+    拒绝发生在 seq 分配之前，不产生 seq 空洞）。
+  - 丢失自愈闭环：reader 检出 seq 空洞 → 精确 ACKNACK（base + 64 位接收窗口 bitmap）
+    → writer 只补发窗口未收到的 seq；已驱逐的 seq 回 GAP 终止 NACK 循环并计丢失
+    （详见 §4 ACKNACK/GAP 段）。断连重连后由周期 HEARTBEAT 驱动同一闭环对齐基线。
+  - reader 按 writer 维序：基线之前的重复样本丢弃（去重，gateway 防环也依赖此），
+    乱序样本先入队、用窗口位跟踪，重传/滑窗导致的重复按位去重。
 - **QoS 兼容性**：`qos_compatible` 为严格 RxO（writer 侧计数/判兼容用）；
   `qos_accepted_by_reader` 是 reader 侧放宽版（reliability 放宽、durability 严格）——
   rmw 测试契约要求这个非对称，不可改动。
+
+预设与入口校验（v3 起）：
+
+- `QosProfile::preset_default()/preset_best_effort()/preset_sensor_data()/
+  preset_transient_local()/preset_bulk_data()` 对应 ROS 2 rmw 预设语义
+  （sensor_data = BEST_EFFORT + depth 5 + deadline 100 ms；bulk_data = KEEP_ALL）。
+- `qos_valid()`：枚举值域检查 + KEEP_LAST 要求 depth ≥ 1；
+  `create_writer/create_reader` 入口校验，非法直接返回 nullptr（fail fast，
+  不让非法 QoS 上线）。rmw 层已在 `rmw_qos_to_mdds` 归一化 SYSTEM_DEFAULT/depth 0，
+  不受影响。
 
 阶段二（本文档 v2 起落地）：
 
@@ -235,7 +276,10 @@ ros2/src/ros2/mdds/
 ├── include/mdds/              公共头：participant/writer/reader/qos/guid/transport
 ├── src/                       frame、fragment、discovery、participant、qos、
 │                              transport_udp、transport_dsoftbus（条件编译）
-└── test/                      gtest 单测 + udp_loopback 双 participant 互通测试
+└── test/                      gtest 单测：frame/fragment 编解码、udp_loopback 双
+                               participant 互通、send_lane 背压/保序、qos 预设与校验、
+                               participant 可靠性（精确 NACK 重传治愈、GAP 丢失判定、
+                               KEEP_ALL 背压）
 ```
 
 - mdds core **不依赖 ROS 头文件**；本 Windows 主机没有可用的 C++ 工具链（无 MSVC，
@@ -273,16 +317,20 @@ ros2/src/ros2/mdds/
    64 KB 载荷（约 16 片/条）20/20 重组成功。构建 `./examples/build_e2e.sh`，
    部署 `/data/local/tmp/mdds_e2e/`（二进制 + libmdds.so + libc++_shared.so）。
 
-## 10. 已知限制（v2）
+## 10. 已知限制（v3）
 
 - 每进程最多 15 条 dsoftbus socket → 单进程可见跨设备 peer 数 ≤ ~14；dsoftbus
   transport 每进程单实例（`ISocketListener` 回调无 user data，经全局表分发）。
 - 不支持多播；大规模节点拓扑未优化（全互联）。
 - lifespan 以 `pub_time_ms`（system_clock）判定，跨设备时钟不同步时过期判定按接收方
   时钟偏移。
-- deadline/liveliness 事件为轮询合成，无后台定时线程；reliable 配对中 seq 空洞的
-  重传样本若晚于更大 seq 到达会被去重丢弃（底层管道保序，正常路径不触发）。
-- writer history 的 KEEP_ALL 实为有限缓存（`kKeepAllCap = 256`）。
+- deadline/liveliness 事件为轮询合成，无后台定时线程。
+- writer history 的 KEEP_ALL 实为有限缓存（`kKeepAllCap = 256`），满时 `write()` 拒绝
+  （背压显式上抛，不静默驱逐）。
+- dsoftbus 发送为 lane 异步： `Transport::send()` 返回 true 仅表示已入队；lane 预算满
+  丢新帧由 reliable 闭环自愈，best_effort 流量在持续超预算时表现为丢包（计数于
+  `SendLane::dropped()`，暂无对上层统计出口）。
+- 单帧发送上限跟随 `GetSessionOption` 探测值；探测失败的通道按 3800 B 分片。
 - gateway 阶段三。（service/client 已由 rmw_mdds 以派生 topic 实现，见 7.1 节。）
 
 ## 11. gateway 桥接契约（阶段三定稿）
