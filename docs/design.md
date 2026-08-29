@@ -12,10 +12,10 @@
 ```
 rclcpp / rclpy
     │  RMW API (rmw.h)
-rmw_mdds            ros2/src/ros2/rmw_mdds   — RMW 绑定、CDR 序列化、graph/wait set
+rmw_mdds            ros2/src/ros2/rmw_mdds/rmw_mdds — RMW 绑定、CDR 序列化、graph/wait set
     │  mdds C++ API
-mdds core           ros2/src/ros2/mdds       — 平台无关：帧编解码、分片重组、发现、
-    │                                           QoS（reliability/history）、端点管理
+mdds core           ros2/src/Jiusi-pys/mdds         — 平台无关：帧编解码、分片重组、发现、
+    │                                                   QoS（reliability/history）、端点管理
     │  transport 抽象接口 (mdds::Transport)
     ├─ transport_dsoftbus   跨设备数据面（仅 OHOS，DSoftBus Socket Bytes）
     └─ transport_udp        UDP loopback：主机单元测试 + 同机多进程互通
@@ -269,7 +269,7 @@ gateway 转发时必须保留完整 24 B 头，不得重写 GUID/seq（client �
 ## 8. 包结构与构建
 
 ```
-ros2/src/ros2/mdds/
+ros2/src/Jiusi-pys/mdds/
 ├── package.xml                ament_cmake，无 ROS 运行时依赖（core 平台无关）
 ├── CMakeLists.txt             libmdds；选项 MDDS_WITH_DSOFTBUS（OHOS 交叉时 ON）、
 │                              BUILD_TESTING（colcon 路径用 ament_cmake_gtest）
