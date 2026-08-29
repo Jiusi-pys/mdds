@@ -58,6 +58,13 @@ struct QosProfile
   uint64_t deadline_ms = 0;   // 0 = infinite
   uint64_t lifespan_ms = 0;   // 0 = infinite
   uint64_t liveliness_lease_ms = 0;  // 0 = infinite
+
+  /// ROS-convention presets (rclcpp/rmw default profiles).
+  static QosProfile preset_default();
+  static QosProfile preset_best_effort();
+  static QosProfile preset_sensor_data();
+  static QosProfile preset_transient_local();
+  static QosProfile preset_bulk_data();
 };
 
 constexpr size_t kQosWireSize = 32;
@@ -65,6 +72,11 @@ constexpr size_t kQosWireSize = 32;
 /// Encode into out[0..kQosWireSize). All fields big-endian.
 void encode_qos(uint8_t * out, const QosProfile & qos);
 bool decode_qos(const uint8_t * in, size_t len, QosProfile & qos);
+
+/// Endpoint acceptance: false when any enum is out of range, or when history
+/// is KEEP_LAST with depth 0 (keeps nothing). create_writer/create_reader
+/// fail fast on invalid QoS instead of announcing nonsense onto the wire.
+bool qos_valid(const QosProfile & qos);
 
 /// DDS requested/offered compatibility: returns true if a reader with
 /// `requested` can match a writer with `offered`.

@@ -49,6 +49,60 @@ uint64_t get_u64(const uint8_t * in)
 
 }  // namespace
 
+QosProfile QosProfile::preset_default()
+{
+  return QosProfile{};
+}
+
+QosProfile QosProfile::preset_best_effort()
+{
+  QosProfile q;
+  q.reliability = Reliability::BEST_EFFORT;
+  q.depth = 1;
+  return q;
+}
+
+QosProfile QosProfile::preset_sensor_data()
+{
+  QosProfile q;
+  q.reliability = Reliability::BEST_EFFORT;
+  q.depth = 5;
+  q.deadline_ms = 100;
+  return q;
+}
+
+QosProfile QosProfile::preset_transient_local()
+{
+  QosProfile q;
+  q.durability = Durability::TRANSIENT_LOCAL;
+  q.reliability = Reliability::RELIABLE;
+  return q;
+}
+
+QosProfile QosProfile::preset_bulk_data()
+{
+  QosProfile q;
+  q.history = History::KEEP_ALL;
+  q.reliability = Reliability::RELIABLE;
+  return q;
+}
+
+bool qos_valid(const QosProfile & qos)
+{
+  if (static_cast<uint8_t>(qos.reliability) > static_cast<uint8_t>(Reliability::RELIABLE) ||
+    static_cast<uint8_t>(qos.durability) > static_cast<uint8_t>(Durability::TRANSIENT_LOCAL) ||
+    static_cast<uint8_t>(qos.history) > static_cast<uint8_t>(History::KEEP_ALL) ||
+    static_cast<uint8_t>(qos.liveliness) > static_cast<uint8_t>(Liveliness::MANUAL_BY_TOPIC))
+  {
+    return false;
+  }
+  // KEEP_LAST with depth 0 keeps nothing.
+  if (qos.history == History::KEEP_LAST && qos.depth == 0) {
+    return false;
+  }
+  return true;
+}
+
 void encode_qos(uint8_t * out, const QosProfile & qos)
 {
   out[0] = static_cast<uint8_t>(qos.reliability);
