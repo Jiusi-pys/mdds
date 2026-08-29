@@ -90,6 +90,18 @@ public:
       return false;
     }
 
+    // Fragmented samples are (re)sent as back-to-back bursts of up to
+    // udp_max_payload-sized datagrams. The kernel-default receive buffer
+    // (208 KiB on Linux) overflows mid-burst and drops the tail datagrams
+    // of every retry alike, livelocking ACKNACK recovery. Raise the buffer;
+    // the kernel clamps the request to rmem_max.
+    {
+      const int rcvbuf = 16 * 1024 * 1024;
+      setsockopt(
+        socket_, SOL_SOCKET, SO_RCVBUF,
+        reinterpret_cast<const char *>(&rcvbuf), sizeof(rcvbuf));
+    }
+
     // Find a free port in the configured range.
     bool bound = false;
     for (uint16_t i = 0; i < config_.udp_port_count; ++i) {
