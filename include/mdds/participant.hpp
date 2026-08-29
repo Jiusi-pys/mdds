@@ -106,11 +106,14 @@ public:
 
   virtual Guid guid() const = 0;
 
+  /// Returns nullptr when `qos` fails qos_valid() (invalid enum range or
+  /// KEEP_LAST with depth 0).
   virtual Writer * create_writer(
     const std::string & topic, const std::string & type_name, const QosProfile & qos) = 0;
   /// `ignore_local` readers skip samples from writers owned by this same
   /// participant (rmw ignore_local_publications). Local delivery itself is
   /// always on for matching local writer/reader pairs.
+  /// Returns nullptr when `qos` fails qos_valid().
   virtual Reader * create_reader(
     const std::string & topic, const std::string & type_name, const QosProfile & qos,
     bool ignore_local = false) = 0;

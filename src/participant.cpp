@@ -420,6 +420,9 @@ public:
   Writer * create_writer(
     const std::string & topic, const std::string & type_name, const QosProfile & qos) override
   {
+    if (!qos_valid(qos)) {
+      return nullptr;  // fail fast: never announce nonsense onto the wire
+    }
     auto w = std::make_unique<WriterImpl>(topic, type_name, qos);
     w->guid_ = make_guid(prefix_, EntityKind::WRITER, ++entity_serial_);
     w->owner_ = this;
@@ -437,6 +440,9 @@ public:
     const std::string & topic, const std::string & type_name, const QosProfile & qos,
     bool ignore_local) override
   {
+    if (!qos_valid(qos)) {
+      return nullptr;  // fail fast, mirrors create_writer
+    }
     auto r = std::make_unique<ReaderImpl>(topic, type_name, qos, ignore_local);
     r->guid_ = make_guid(prefix_, EntityKind::READER, ++entity_serial_);
     r->owner_ = this;

@@ -664,4 +664,29 @@ TEST(ReliabilityTest, KeepAllWriterBackpressure)
   EXPECT_FALSE(w->write(reinterpret_cast<const uint8_t *>(msg), sizeof(msg)));
 }
 
+// Invalid QoS is rejected at endpoint creation (fail fast), not propagated
+// onto the wire.
+TEST_F(ParticipantFixture, InvalidQosRejected)
+{
+  auto bad_enum = default_qos();
+  bad_enum.reliability = static_cast<mdds::Reliability>(7);
+  EXPECT_EQ(pa_->create_writer("/bad1", "test/Bad", bad_enum), nullptr);
+  EXPECT_EQ(pa_->create_reader("/bad1", "test/Bad", bad_enum), nullptr);
+
+  auto zero_depth = default_qos();  // KEEP_LAST with depth 0 keeps nothing
+  zero_depth.depth = 0;
+  EXPECT_EQ(pa_->create_writer("/bad2", "test/Bad", zero_depth), nullptr);
+  EXPECT_EQ(pa_->create_reader("/bad2", "test/Bad", zero_depth), nullptr);
+
+  auto keep_all = default_qos();  // depth is ignored under KEEP_ALL: valid
+  keep_all.history = mdds::History::KEEP_ALL;
+  keep_all.depth = 0;
+  EXPECT_NE(pa_->create_writer("/ok1", "test/Ok", keep_all), nullptr);
+
+  // A rejected endpoint must not appear in the graph announcement.
+  auto bad_liveliness = default_qos();
+  bad_liveliness.liveliness = static_cast<mdds::Liveliness>(9);
+  EXPECT_EQ(pa_->create_writer("/bad3", "test/Bad", bad_liveliness), nullptr);
+}
+
 }  // namespace

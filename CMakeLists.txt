@@ -85,6 +85,7 @@ if(BUILD_TESTING)
     test_fragment
     test_transport_udp
     test_send_lane
+    test_qos
     test_participant
   )
   if(ament_cmake_ros_FOUND)
