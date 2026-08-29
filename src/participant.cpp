@@ -115,16 +115,23 @@ public:
   };
   std::deque<CachedSample> history_;
 
-  void cache_sample(uint64_t seq, uint64_t pub_time_ms, const uint8_t * data, size_t len)
+  /// Cache one published sample for retransmission / late-joiner replay.
+  /// Returns false when a KEEP_ALL history is already full: the sample is
+  /// rejected (backpressure) instead of silently evicting the oldest entry,
+  /// which would violate KEEP_ALL semantics.
+  bool cache_sample(uint64_t seq, uint64_t pub_time_ms, const uint8_t * data, size_t len)
   {
     if (qos_.reliability != Reliability::RELIABLE &&
       qos_.durability != Durability::TRANSIENT_LOCAL)
     {
-      return;
+      return true;
     }
-    history_.push_back(CachedSample{seq, pub_time_ms, std::vector<uint8_t>(data, data + len)});
     const size_t cap =
       qos_.history == History::KEEP_ALL ? kKeepAllCap : std::max<size_t>(qos_.depth, 1);
+    if (qos_.history == History::KEEP_ALL && history_.size() >= cap) {
+      return false;
+    }
+    history_.push_back(CachedSample{seq, pub_time_ms, std::vector<uint8_t>(data, data + len)});
     while (history_.size() > cap) {
       history_.pop_front();
     }
@@ -135,6 +142,7 @@ public:
     {
       history_.pop_front();
     }
+    return true;
   }
 };
 
@@ -189,26 +197,52 @@ public:
   /// Enqueue one sample from a (remote or local) writer. Returns true if the
   /// sample was queued and the data callback (if any) should be fired by the
   /// caller (outside any lock). Duplicates and lifespan-expired samples are
-  /// dropped (the sequence baseline still advances so expired reliable
-  /// samples are not NACKed forever).
+  /// dropped. Out-of-order receipts within a 64-seq window are tracked so
+  /// retransmissions can heal holes; missing seqs are only counted lost when
+  /// the writer GAPs them or the sequence jumps beyond the window.
   bool enqueue(
     const Guid & writer_guid, uint64_t seq, const uint8_t * data, size_t len,
     const QosProfile & writer_qos, uint64_t pub_time_ms,
-    bool & gap_detected, uint64_t & gap_base)
+    bool & gap_detected, uint64_t & gap_base, uint64_t & gap_bitmap)
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
-    uint64_t & last = last_seq_[writer_guid];
-    if (seq <= last) {
+    WriterRxState & st = rx_[writer_guid];
+    if (seq <= st.last_seq) {
       return false;  // duplicate (also the gateway anti-loop guard)
     }
-    if (last != 0 && seq > last + 1) {
-      lost_count_ += seq - last - 1;
+    const uint64_t offset = seq - st.last_seq - 1;
+    if (offset >= 64) {
+      // Too far ahead to track: declare the whole hole lost and jump. No
+      // NACK is useful afterwards (resends would be <= last_seq), so this
+      // does not set gap_detected.
+      lost_count_ += offset;
+      st.last_seq = seq;
+      st.window = 0;
+    } else if (offset > 0) {
+      if (st.window & (1ULL << offset)) {
+        return false;  // duplicate retransmit of an already-received sample
+      }
+      st.window |= (1ULL << offset);
       gap_detected =
         qos_.reliability == Reliability::RELIABLE &&
         writer_qos.reliability == Reliability::RELIABLE;
-      gap_base = last + 1;
+      gap_base = st.last_seq + 1;
+      gap_bitmap = st.window;
+    } else {
+      // offset == 0, contiguous arrival. The bit for this position may
+      // already be set: apply_gap() can slide the baseline up to an
+      // out-of-order receipt; then a late retransmit of it is a duplicate.
+      const bool already_received = (st.window & 1ULL) != 0;
+      ++st.last_seq;
+      st.window >>= 1;
+      while (st.window & 1ULL) {
+        ++st.last_seq;
+        st.window >>= 1;
+      }
+      if (already_received) {
+        return false;  // baseline slid, nothing to queue
+      }
     }
-    last = seq;
 
     if (lifespan_expired(writer_qos.lifespan_ms, pub_time_ms, system_now_ms())) {
       return false;  // already expired on arrival: drop without queueing
@@ -228,6 +262,50 @@ public:
     }
     sweep_expired_locked();
     return true;
+  }
+
+  /// Current NACK state for a writer: (base, bitmap) where bit i of bitmap
+  /// says seq base+i was already received. base is always the first missing
+  /// seq. Used by the heartbeat handler to emit precise ACKNACKs.
+  /// Caller must NOT hold queue_mutex_.
+  std::pair<uint64_t, uint64_t> nack_state(const Guid & writer_guid)
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    const auto it = rx_.find(writer_guid);
+    if (it == rx_.end()) {
+      return {1, 0};
+    }
+    return {it->second.last_seq + 1, it->second.window};
+  }
+
+  /// The writer declared [gap_start, gap_end] (inclusive) evicted forever.
+  /// Advance the baseline past the range, counting not-received seqs as lost
+  /// exactly once. Seqs already received (window bits) are not lost.
+  void apply_gap(const Guid & writer_guid, uint64_t gap_start, uint64_t gap_end)
+  {
+    // gap_start only bounds the writer's announcement; seqs <= last_seq are
+    // already accounted for, so the effective range is (last_seq, gap_end].
+    static_cast<void>(gap_start);
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    const auto it = rx_.find(writer_guid);
+    if (it == rx_.end()) {
+      return;  // never received anything from this writer
+    }
+    WriterRxState & st = it->second;
+    if (gap_end <= st.last_seq) {
+      return;  // already accounted for
+    }
+    const uint64_t span = gap_end - st.last_seq;  // seqs (last_seq, gap_end]
+    uint64_t received = 0;
+    const uint64_t tracked = std::min<uint64_t>(span, 64);
+    for (uint64_t i = 0; i < tracked; ++i) {
+      if (st.window & (1ULL << i)) {
+        ++received;
+      }
+    }
+    lost_count_ += span - received;
+    st.last_seq = gap_end;
+    st.window = span >= 64 ? 0 : (st.window >> span);
   }
 
   void fire_callback()
@@ -259,7 +337,15 @@ public:
 
   mutable std::mutex queue_mutex_;
   mutable std::deque<QueuedSample> queue_;
-  std::map<Guid, uint64_t> last_seq_;  // per remote writer
+  // Per-remote-writer receive state: contiguous baseline + a 64-seq window of
+  // out-of-order receipts (bit i set <=> seq last_seq+1+i received). Drives
+  // precise ACKNACK bitmaps, duplicate suppression and GAP healing.
+  struct WriterRxState
+  {
+    uint64_t last_seq = 0;
+    uint64_t window = 0;
+  };
+  std::map<Guid, WriterRxState> rx_;
   uint64_t lost_count_ = 0;            // cumulative sequence gaps
   std::function<void()> data_callback_;
 
@@ -454,14 +540,20 @@ public:
   // ---- writer send path ----
   bool write_sample(WriterImpl * w, const uint8_t * data, size_t len)
   {
-    const uint64_t seq = ++w->seq_;
     const uint64_t pub_time_ms = system_now_ms();
 
     std::vector<PeerId> targets;
     std::vector<ReaderImpl *> local_readers;
+    uint64_t seq = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      w->cache_sample(seq, pub_time_ms, data, len);
+      // Claim the sequence number under the lock so a rejected cache write
+      // (KEEP_ALL backpressure) does not burn a seq and open a hole.
+      seq = w->seq_.load() + 1;
+      if (!w->cache_sample(seq, pub_time_ms, data, len)) {
+        return false;  // KEEP_ALL history full: rejected, nothing sent
+      }
+      w->seq_.store(seq);
       targets = send_targets_locked(*w);
       // Intra-participant delivery: matching local readers get the sample
       // straight from the writer history, no wire hop.
@@ -481,14 +573,17 @@ public:
     for (ReaderImpl * r : local_readers) {
       bool gap = false;
       uint64_t gap_base = 0;
-      if (r->enqueue(w->guid_, seq, data, len, w->qos_, pub_time_ms, gap, gap_base)) {
+      uint64_t gap_bitmap = 0;
+      if (r->enqueue(w->guid_, seq, data, len, w->qos_, pub_time_ms, gap, gap_base, gap_bitmap)) {
         r->fire_callback();
       }
     }
 
+    const uint16_t flags =
+      w->qos_.reliability == Reliability::RELIABLE ? kFlagReliable : 0;
     bool any = false;
     for (PeerId peer : targets) {
-      any |= send_sample_to(peer, w->guid_, seq, pub_time_ms, data, len);
+      any |= send_sample_to(peer, w->guid_, seq, pub_time_ms, data, len, flags);
     }
     return any || targets.empty();  // no matched peers is not a failure
   }
@@ -594,6 +689,9 @@ public:
       case FrameType::HEARTBEAT:
         handle_heartbeat(peer, data, len);
         break;
+      case FrameType::GAP:
+        handle_gap(peer, data, len);
+        break;
     }
   }
 
@@ -676,12 +774,15 @@ private:
     // Collect retransmits under lock, send after unlocking.
     std::vector<WriterImpl::CachedSample> resend;
     Guid writer_guid = body.writer;
+    uint16_t flags = 0;
+    uint64_t gap_end = 0;  // highest requested seq already evicted from history
     {
       std::lock_guard<std::mutex> lock(mutex_);
       WriterImpl * w = find_writer_locked(writer_guid);
       if (w == nullptr) {
         return;
       }
+      flags = w->qos_.reliability == Reliability::RELIABLE ? kFlagReliable : 0;
       // Volatile readers must not pull history from before their join: clamp
       // resends to seqs above the recorded join watermark.
       uint64_t join_floor = 0;
@@ -695,22 +796,54 @@ private:
           }
         }
       }
+      // The history is contiguous: it holds [first_avail, latest published].
+      const uint64_t first_avail =
+        w->history_.empty() ? 0 : w->history_.front().seq;
       for (uint64_t i = 0; i < 64; ++i) {
         const uint64_t seq = body.base_seq + i;
         if (body.bitmap & (1ULL << i) || seq <= join_floor) {
           continue;  // already received, or predates the volatile reader's join
         }
+        bool found = false;
         for (const auto & entry : w->history_) {
           if (entry.seq == seq) {
             resend.push_back(entry);
+            found = true;
             break;
           }
+        }
+        if (!found && first_avail > 0 && seq < first_avail) {
+          gap_end = seq;  // evicted: will never be retransmitted, tell the reader
         }
       }
     }
     for (const auto & entry : resend) {
       send_sample_to(
-        peer, writer_guid, entry.seq, entry.pub_time_ms, entry.data.data(), entry.data.size());
+        peer, writer_guid, entry.seq, entry.pub_time_ms,
+        entry.data.data(), entry.data.size(), flags);
+    }
+    if (gap_end > 0) {
+      // GAP terminates the NACK loop for evicted seqs: the reader advances
+      // its baseline and counts them lost exactly once.
+      auto frame = encode_gap(writer_guid, body.base_seq, gap_end);
+      send_frame(peer, frame.data(), frame.size());
+    }
+  }
+
+  /// GAP from a remote writer: [gap_start, gap_end] was evicted and will
+  /// never be retransmitted. Applied to every local reader that has state
+  /// for the writer (the endpoint match was validated when data was first
+  /// enqueued, so this stays correct while discovery is churning).
+  void handle_gap(PeerId peer, const uint8_t * data, size_t len)
+  {
+    static_cast<void>(peer);
+    GapBody body;
+    if (!decode_gap(data, len, body) || body.gap_end < body.gap_start) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto & kv : readers_) {
+      kv.first->apply_gap(body.writer, body.gap_start, body.gap_end);
     }
   }
 
@@ -720,8 +853,14 @@ private:
     if (!decode_heartbeat(data, len, body)) {
       return;
     }
-    // Any local reader matched to this writer that is behind sends an ACKNACK.
-    std::vector<std::pair<Guid, uint64_t>> nacks;  // (reader guid, gap base)
+    struct Nack
+    {
+      Guid reader;
+      uint64_t base;
+      uint64_t bitmap;
+    };
+    // Any matched reliable reader that is behind sends a precise ACKNACK.
+    std::vector<Nack> nacks;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       // A heartbeat refreshes the writer's liveliness (MANUAL_BY_TOPIC assert
@@ -733,24 +872,20 @@ private:
       }
       for (auto & kv : readers_) {
         ReaderImpl * r = kv.first;
+        if (r->qos_.reliability != Reliability::RELIABLE) {
+          continue;  // best-effort readers never request retransmission
+        }
         if (!endpoints_match(r->topic_, r->type_, r->qos_, *writer_ep)) {
           continue;
         }
-        uint64_t last = 0;
-        {
-          std::lock_guard<std::mutex> qlock(r->queue_mutex_);
-          auto it = r->last_seq_.find(body.writer);
-          if (it != r->last_seq_.end()) {
-            last = it->second;
-          }
-        }
-        if (last < body.last_seq) {
-          nacks.emplace_back(r->guid_, last + 1);
+        const auto st = r->nack_state(body.writer);  // (base, bitmap)
+        if (st.first <= body.last_seq) {
+          nacks.push_back(Nack{r->guid_, st.first, st.second});
         }
       }
     }
     for (const auto & nk : nacks) {
-      auto frame = encode_acknack(nk.first, body.writer, nk.second, 0);
+      auto frame = encode_acknack(nk.reader, body.writer, nk.base, nk.bitmap);
       send_frame(peer, frame.data(), frame.size());
     }
   }
@@ -759,8 +894,14 @@ private:
     PeerId peer, const Guid & writer_guid, uint64_t seq, uint64_t pub_time_ms,
     const uint8_t * data, size_t len)
   {
+    struct NackRequest
+    {
+      Guid reader;
+      uint64_t base;
+      uint64_t bitmap;
+    };
     std::vector<ReaderImpl *> to_notify;
-    std::vector<std::pair<Guid, uint64_t>> gaps;  // (reader guid, gap base)
+    std::vector<NackRequest> gaps;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       // Received data refreshes the writer's liveliness regardless of matching.
@@ -776,18 +917,20 @@ private:
         }
         bool gap = false;
         uint64_t gap_base = 0;
+        uint64_t gap_bitmap = 0;
         if (r->enqueue(
-            writer_guid, seq, data, len, writer_ep->qos, pub_time_ms, gap, gap_base))
+            writer_guid, seq, data, len, writer_ep->qos, pub_time_ms,
+            gap, gap_base, gap_bitmap))
         {
           to_notify.push_back(r);
         }
         if (gap) {
-          gaps.emplace_back(r->guid_, gap_base);
+          gaps.push_back(NackRequest{r->guid_, gap_base, gap_bitmap});
         }
       }
     }
     for (const auto & g : gaps) {
-      auto frame = encode_acknack(g.first, writer_guid, g.second, 0);
+      auto frame = encode_acknack(g.reader, writer_guid, g.base, g.bitmap);
       send_frame(peer, frame.data(), frame.size());
     }
     for (ReaderImpl * r : to_notify) {
@@ -825,9 +968,10 @@ private:
           }
           bool gap = false;
           uint64_t gap_base = 0;
+          uint64_t gap_bitmap = 0;
           any |= r->enqueue(
             w->guid_, e.seq, e.data.data(), e.data.size(), w->qos_, e.pub_time_ms,
-            gap, gap_base);
+            gap, gap_base, gap_bitmap);
         }
       }
     }
@@ -845,6 +989,7 @@ private:
     }
     std::vector<WriterImpl::CachedSample> todo;
     std::vector<Guid> todo_writer;
+    std::vector<uint16_t> todo_flags;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       const uint64_t now = system_now_ms();
@@ -864,6 +1009,8 @@ private:
             if (!lifespan_expired(w->qos_.lifespan_ms, e.pub_time_ms, now)) {
               todo.push_back(e);
               todo_writer.push_back(w->guid_);
+              todo_flags.push_back(
+                w->qos_.reliability == Reliability::RELIABLE ? kFlagReliable : 0);
             }
           }
         }
@@ -872,7 +1019,7 @@ private:
     for (size_t i = 0; i < todo.size(); ++i) {
       send_sample_to(
         peer, todo_writer[i], todo[i].seq, todo[i].pub_time_ms,
-        todo[i].data.data(), todo[i].data.size());
+        todo[i].data.data(), todo[i].data.size(), todo_flags[i]);
     }
   }
 
@@ -907,14 +1054,14 @@ private:
 
   bool send_sample_to(
     PeerId peer, const Guid & writer_guid, uint64_t seq, uint64_t pub_time_ms,
-    const uint8_t * data, size_t len)
+    const uint8_t * data, size_t len, uint16_t flags = 0)
   {
     const size_t max_p = max_payload(peer);
     if (max_p == 0) {
       return false;
     }
     auto frames = Fragmenter::fragment(
-      writer_guid, seq, pub_time_ms, data, static_cast<uint32_t>(len), max_p);
+      writer_guid, seq, pub_time_ms, data, static_cast<uint32_t>(len), max_p, flags);
     bool ok = true;
     for (const auto & f : frames) {
       ok = send_frame(peer, f.data(), f.size()) && ok;
@@ -924,6 +1071,9 @@ private:
 
   bool send_frame(PeerId peer, const uint8_t * data, size_t len)
   {
+    if (config_.test_send_hook && config_.test_send_hook(data, len)) {
+      return true;  // test-simulated loss: invisible to the sender
+    }
     const size_t idx = peer_transport_index(peer);
     if (idx >= transports_.size() || !transports_[idx]) {
       return false;

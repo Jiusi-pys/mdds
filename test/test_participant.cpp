@@ -18,11 +18,13 @@
 #include <condition_variable>
 #include <cstring>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "mdds/frame.hpp"
 #include "mdds/participant.hpp"
 
 namespace
@@ -468,6 +470,198 @@ TEST_F(ParticipantQosFixture, AssertLivelinessSendsHeartbeat)
   }
   ASSERT_TRUE(pb_->remote_writer_last_seen_ms(w->guid(), after));
   EXPECT_GT(after, before);
+}
+
+// ---- reliability: precise NACK / GAP / KEEP_ALL backpressure (wire v3) ----
+
+constexpr uint16_t kTestBasePort3 = 48257;
+
+mdds::ParticipantConfig test_config_3()
+{
+  mdds::ParticipantConfig cfg = test_config();
+  cfg.udp_base_port = kTestBasePort3;
+  cfg.announce_period_ms = 100;
+  return cfg;
+}
+
+bool wait_matched(mdds::Writer * w, size_t n, std::chrono::milliseconds t = 10s)
+{
+  auto deadline = std::chrono::steady_clock::now() + t;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (w->matched_count() >= n) {
+      return true;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  return false;
+}
+
+/// Reader-side counterpart: the reader has discovered the remote writer.
+/// DATA from a not-yet-discovered writer is dropped (not counted lost), so
+/// tests must wait for this before writing, or early samples vanish.
+bool wait_reader_matched(mdds::Reader * r, size_t n, std::chrono::milliseconds t = 10s)
+{
+  auto deadline = std::chrono::steady_clock::now() + t;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (r->matched_count() >= n) {
+      return true;
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  return false;
+}
+
+/// True when the frame is a DATA frame carrying `seq`.
+bool is_data_seq(const uint8_t * frame, size_t len, uint64_t seq)
+{
+  mdds::FrameHeader hdr{};
+  if (!mdds::decode_header(frame, len, hdr) || hdr.type != mdds::FrameType::DATA) {
+    return false;
+  }
+  mdds::DataBody body{};
+  return mdds::decode_data(frame, len, body) && body.seq == seq;
+}
+
+// A dropped DATA frame is healed by precise NACK + retransmission, and the
+// reader never counts the healed hole as lost.
+TEST(ReliabilityTest, RetransmitHealsDroppedFrame)
+{
+  std::atomic<size_t> seq2_sends{0};
+  std::atomic<bool> dropped_once{false};
+  std::atomic<uint64_t> nack_bitmap_at_base2{0};
+  auto cfg_a = test_config_3();
+  cfg_a.test_send_hook = [&](const uint8_t * f, size_t n) {
+    if (is_data_seq(f, n, 2)) {
+      ++seq2_sends;
+      if (!dropped_once.exchange(true)) {
+        return true;  // drop the first copy of seq 2
+      }
+    }
+    return false;
+  };
+  auto cfg_b = test_config_3();
+  cfg_b.test_send_hook = [&](const uint8_t * f, size_t n) {
+    mdds::FrameHeader hdr{};
+    if (mdds::decode_header(f, n, hdr) && hdr.type == mdds::FrameType::ACKNACK) {
+      mdds::AckNackBody body{};
+      if (mdds::decode_acknack(f, n, body) && body.base_seq == 2 && body.bitmap != 0) {
+        nack_bitmap_at_base2 = body.bitmap;
+      }
+    }
+    return false;
+  };
+  auto pa = mdds::Participant::create(cfg_a);
+  auto pb = mdds::Participant::create(cfg_b);
+  ASSERT_NE(pa, nullptr);
+  ASSERT_NE(pb, nullptr);
+
+  auto * w = pa->create_writer("/rel", "test/Rel", default_qos());
+  auto * r = pb->create_reader("/rel", "test/Rel", default_qos());
+  ASSERT_TRUE(wait_matched(w, 1));
+  ASSERT_TRUE(wait_reader_matched(r, 1));
+
+  for (int i = 0; i < 3; ++i) {
+    std::string m = "s" + std::to_string(i + 1);
+    ASSERT_TRUE(w->write(reinterpret_cast<const uint8_t *>(m.data()), m.size()));
+  }
+
+  std::set<uint64_t> got;
+  auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (std::chrono::steady_clock::now() < deadline && got.size() < 3) {
+    std::vector<uint8_t> out;
+    mdds::MessageInfo info;
+    if (r->take(out, info)) {
+      got.insert(info.seq);
+    } else {
+      std::this_thread::sleep_for(5ms);
+    }
+  }
+  EXPECT_EQ(got, (std::set<uint64_t>{1, 2, 3}));  // seq 2 healed out of order
+  EXPECT_EQ(r->messages_lost(), 0u);  // a healed hole is never counted lost
+  EXPECT_GE(seq2_sends.load(), 2u);   // original + at least one retransmit
+  // The NACK for base 2 must mark seq 3 (base+1) as already received.
+  if (nack_bitmap_at_base2.load() != 0) {
+    EXPECT_EQ(nack_bitmap_at_base2.load() & 0b10ULL, 0b10ULL);
+  }
+}
+
+// A permanently lost seq that the writer has already evicted is closed by a
+// GAP frame: counted lost exactly once, NACK loop terminates.
+TEST(ReliabilityTest, GapDeclaresEvictedSeqsLost)
+{
+  std::atomic<size_t> gap_frames{0};
+  auto cfg_a = test_config_3();
+  cfg_a.test_send_hook = [&](const uint8_t * f, size_t n) {
+    mdds::FrameHeader hdr{};
+    if (mdds::decode_header(f, n, hdr)) {
+      if (hdr.type == mdds::FrameType::GAP) {
+        mdds::GapBody g{};
+        if (mdds::decode_gap(f, n, g) && g.gap_start == 2 && g.gap_end == 2) {
+          ++gap_frames;
+        }
+      }
+      return is_data_seq(f, n, 2);  // seq 2 never reaches the reader
+    }
+    return false;
+  };
+  auto pa = mdds::Participant::create(cfg_a);
+  auto pb = mdds::Participant::create(test_config_3());
+  ASSERT_NE(pa, nullptr);
+  ASSERT_NE(pb, nullptr);
+
+  auto writer_qos = default_qos();
+  writer_qos.depth = 1;  // writer history holds only the latest sample
+  auto * w = pa->create_writer("/gap", "test/Gap", writer_qos);
+  auto * r = pb->create_reader("/gap", "test/Gap", default_qos());
+  ASSERT_TRUE(wait_matched(w, 1));
+  ASSERT_TRUE(wait_reader_matched(r, 1));
+
+  for (int i = 0; i < 4; ++i) {
+    std::string m = "s" + std::to_string(i + 1);
+    ASSERT_TRUE(w->write(reinterpret_cast<const uint8_t *>(m.data()), m.size()));
+  }
+
+  auto deadline = std::chrono::steady_clock::now() + 10s;
+  while (std::chrono::steady_clock::now() < deadline && r->messages_lost() != 1) {
+    std::this_thread::sleep_for(10ms);
+  }
+  EXPECT_EQ(r->messages_lost(), 1u);  // exactly seq 2
+  EXPECT_GE(gap_frames.load(), 1u);
+
+  std::set<uint64_t> got;
+  deadline = std::chrono::steady_clock::now() + 10s;
+  while (std::chrono::steady_clock::now() < deadline && got.size() < 3) {
+    std::vector<uint8_t> out;
+    mdds::MessageInfo info;
+    if (r->take(out, info)) {
+      got.insert(info.seq);
+    } else {
+      std::this_thread::sleep_for(5ms);
+    }
+  }
+  EXPECT_EQ(got, (std::set<uint64_t>{1, 3, 4}));
+
+  // Further heartbeats/NACKs must not double-count the healed gap.
+  std::this_thread::sleep_for(500ms);
+  EXPECT_EQ(r->messages_lost(), 1u);
+}
+
+// KEEP_ALL writer history full -> write() rejects instead of silently
+// evicting the oldest sample (KEEP_ALL semantics are not negotiable).
+TEST(ReliabilityTest, KeepAllWriterBackpressure)
+{
+  auto p = mdds::Participant::create(test_config_3());
+  ASSERT_NE(p, nullptr);
+  auto qos = default_qos();
+  qos.history = mdds::History::KEEP_ALL;
+  auto * w = p->create_writer("/ka", "test/Ka", qos);
+  const char msg[] = "x";
+  // kKeepAllCap = 256 (participant.cpp): the first 256 writes are cached.
+  for (int i = 0; i < 256; ++i) {
+    ASSERT_TRUE(w->write(reinterpret_cast<const uint8_t *>(msg), sizeof(msg))) << i;
+  }
+  EXPECT_FALSE(w->write(reinterpret_cast<const uint8_t *>(msg), sizeof(msg)));
+  EXPECT_FALSE(w->write(reinterpret_cast<const uint8_t *>(msg), sizeof(msg)));
 }
 
 }  // namespace

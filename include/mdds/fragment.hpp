@@ -36,11 +36,12 @@ public:
   /// Returns the wire frames for one sample. Empty if the input is invalid
   /// (payload null while payload_len > 0, or max_payload too small to make
   /// progress). `pub_time_ms` (system_clock ms at write time) is stamped on
-  /// every produced frame for lifespan bookkeeping.
+  /// every produced frame for lifespan bookkeeping; `flags` (e.g.
+  /// kFlagReliable) is stamped on every produced frame header.
   static std::vector<std::vector<uint8_t>> fragment(
     const Guid & writer, uint64_t seq, uint64_t pub_time_ms,
     const uint8_t * payload, uint32_t payload_len,
-    size_t max_payload);
+    size_t max_payload, uint16_t flags = 0);
 };
 
 /// Reassembles DATA_FRAG sequences back into complete samples. Coverage is

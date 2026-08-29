@@ -84,6 +84,39 @@ void get_guid(const uint8_t * in, Guid & g)
   std::memcpy(g.bytes.data(), in, g.bytes.size());
 }
 
+/// Tolerant TLV trailer parser: fills `out` with the recognized entries,
+/// silently skipping unknown types and stopping (without failing) at the
+/// first malformed entry. Returns true when all bytes parsed cleanly.
+bool parse_trailer(const uint8_t * buf, size_t len, DataTrailer & out)
+{
+  size_t pos = 0;
+  while (pos + 2 <= len) {
+    const uint8_t type = buf[pos];
+    const uint8_t tlen = buf[pos + 1];
+    if (pos + 2 + tlen > len) {
+      return false;  // truncated entry; keep what was parsed so far
+    }
+    const uint8_t * value = buf + pos + 2;
+    switch (type) {
+      case kTlvOriginGuid:
+        if (tlen == 16) {
+          get_guid(value, out.origin_guid);
+          out.has_origin = true;
+        }
+        break;
+      case kTlvOriginSeq:
+        if (tlen == 8) {
+          out.origin_seq = get_u64(value);
+        }
+        break;
+      default:
+        break;  // unknown entry: skip, stay forward compatible
+    }
+    pos += 2 + tlen;
+  }
+  return pos == len;
+}
+
 }  // namespace
 
 void encode_header(uint8_t * out, FrameType type, uint16_t flags, uint32_t body_len)
@@ -118,18 +151,42 @@ bool decode_header(const uint8_t * buf, size_t len, FrameHeader & out)
   return true;
 }
 
+std::vector<uint8_t> encode_trailer(const DataTrailer & trailer)
+{
+  std::vector<uint8_t> out;
+  if (!trailer.has_origin) {
+    return out;
+  }
+  out.resize(2 + 16 + 2 + 8);
+  out[0] = kTlvOriginGuid;
+  out[1] = 16;
+  put_guid(out.data() + 2, trailer.origin_guid);
+  out[18] = kTlvOriginSeq;
+  out[19] = 8;
+  put_u64(out.data() + 20, trailer.origin_seq);
+  return out;
+}
+
 std::vector<uint8_t> encode_data(
   const Guid & writer, uint64_t seq, uint64_t pub_time_ms,
-  const uint8_t * payload, uint32_t payload_len)
+  const uint8_t * payload, uint32_t payload_len,
+  uint16_t flags, const DataTrailer * trailer)
 {
-  std::vector<uint8_t> out(kHeaderSize + kDataBodyFixedSize + payload_len);
-  encode_header(out.data(), FrameType::DATA, 0, kDataBodyFixedSize + payload_len);
+  const std::vector<uint8_t> tail = trailer != nullptr ? encode_trailer(*trailer) :
+    std::vector<uint8_t>();
+  const uint32_t body_len = kDataBodyFixedSize + payload_len + tail.size();
+  std::vector<uint8_t> out(kHeaderSize + body_len);
+  encode_header(out.data(), FrameType::DATA, flags, body_len);
   uint8_t * body = out.data() + kHeaderSize;
   put_guid(body, writer);
   put_u64(body + 16, seq);
   put_u64(body + 24, pub_time_ms);
+  put_u32(body + 32, payload_len);
   if (payload_len > 0 && payload != nullptr) {
     std::memcpy(body + kDataBodyFixedSize, payload, payload_len);
+  }
+  if (!tail.empty()) {
+    std::memcpy(body + kDataBodyFixedSize + payload_len, tail.data(), tail.size());
   }
   return out;
 }
@@ -147,26 +204,42 @@ bool decode_data(const uint8_t * buf, size_t len, DataBody & out)
   get_guid(body, out.writer);
   out.seq = get_u64(body + 16);
   out.pub_time_ms = get_u64(body + 24);
+  out.payload_len = get_u32(body + 32);
+  if (hdr.body_len - kDataBodyFixedSize < out.payload_len) {
+    return false;
+  }
   out.payload = body + kDataBodyFixedSize;
-  out.payload_len = hdr.body_len - kDataBodyFixedSize;
+  out.trailer = DataTrailer{};
+  const size_t tail_off = kDataBodyFixedSize + out.payload_len;
+  if (hdr.body_len > tail_off) {
+    parse_trailer(body + tail_off, hdr.body_len - tail_off, out.trailer);
+  }
   return true;
 }
 
 std::vector<uint8_t> encode_data_frag(
   const Guid & writer, uint64_t seq, uint64_t pub_time_ms,
   uint32_t total_size, uint32_t frag_offset,
-  const uint8_t * payload, uint32_t payload_len)
+  const uint8_t * payload, uint32_t payload_len,
+  uint16_t flags, const DataTrailer * trailer)
 {
-  std::vector<uint8_t> out(kHeaderSize + kDataFragBodyFixedSize + payload_len);
-  encode_header(out.data(), FrameType::DATA_FRAG, 0, kDataFragBodyFixedSize + payload_len);
+  const std::vector<uint8_t> tail = trailer != nullptr ? encode_trailer(*trailer) :
+    std::vector<uint8_t>();
+  const uint32_t body_len = kDataFragBodyFixedSize + payload_len + tail.size();
+  std::vector<uint8_t> out(kHeaderSize + body_len);
+  encode_header(out.data(), FrameType::DATA_FRAG, flags, body_len);
   uint8_t * body = out.data() + kHeaderSize;
   put_guid(body, writer);
   put_u64(body + 16, seq);
   put_u64(body + 24, pub_time_ms);
   put_u32(body + 32, total_size);
   put_u32(body + 36, frag_offset);
+  put_u32(body + 40, payload_len);
   if (payload_len > 0 && payload != nullptr) {
     std::memcpy(body + kDataFragBodyFixedSize, payload, payload_len);
+  }
+  if (!tail.empty()) {
+    std::memcpy(body + kDataFragBodyFixedSize + payload_len, tail.data(), tail.size());
   }
   return out;
 }
@@ -186,8 +259,16 @@ bool decode_data_frag(const uint8_t * buf, size_t len, DataFragBody & out)
   out.pub_time_ms = get_u64(body + 24);
   out.total_size = get_u32(body + 32);
   out.frag_offset = get_u32(body + 36);
+  out.payload_len = get_u32(body + 40);
+  if (hdr.body_len - kDataFragBodyFixedSize < out.payload_len) {
+    return false;
+  }
   out.payload = body + kDataFragBodyFixedSize;
-  out.payload_len = hdr.body_len - kDataFragBodyFixedSize;
+  out.trailer = DataTrailer{};
+  const size_t tail_off = kDataFragBodyFixedSize + out.payload_len;
+  if (hdr.body_len > tail_off) {
+    parse_trailer(body + tail_off, hdr.body_len - tail_off, out.trailer);
+  }
   if (static_cast<uint64_t>(out.frag_offset) + out.payload_len > out.total_size) {
     return false;
   }
@@ -249,6 +330,34 @@ bool decode_heartbeat(const uint8_t * buf, size_t len, HeartbeatBody & out)
   get_guid(body, out.writer);
   out.first_seq = get_u64(body + 16);
   out.last_seq = get_u64(body + 24);
+  return true;
+}
+
+std::vector<uint8_t> encode_gap(
+  const Guid & writer, uint64_t gap_start, uint64_t gap_end)
+{
+  std::vector<uint8_t> out(kHeaderSize + kGapBodySize);
+  encode_header(out.data(), FrameType::GAP, 0, kGapBodySize);
+  uint8_t * body = out.data() + kHeaderSize;
+  put_guid(body, writer);
+  put_u64(body + 16, gap_start);
+  put_u64(body + 24, gap_end);
+  return out;
+}
+
+bool decode_gap(const uint8_t * buf, size_t len, GapBody & out)
+{
+  FrameHeader hdr;
+  if (!decode_header(buf, len, hdr) || hdr.type != FrameType::GAP) {
+    return false;
+  }
+  if (hdr.body_len < kGapBodySize) {
+    return false;
+  }
+  const uint8_t * body = buf + kHeaderSize;
+  get_guid(body, out.writer);
+  out.gap_start = get_u64(body + 16);
+  out.gap_end = get_u64(body + 24);
   return true;
 }
 

@@ -87,6 +87,12 @@ struct ParticipantConfig
   uint16_t udp_base_port = 47811;
   uint16_t udp_port_count = 32;
   uint32_t udp_announce_ms = 500;
+
+  /// Test-only hook invoked for every outbound frame just before it is
+  /// handed to the transport; return true to drop the frame (simulates
+  /// network loss, invisible to the sender). Runs on internal threads, so
+  /// it must be cheap and non-blocking. Null in production.
+  std::function<bool(const uint8_t * frame, size_t len)> test_send_hook;
 };
 
 /// One mdds domain participant. Owns transports, discovery, endpoint tables

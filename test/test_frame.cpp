@@ -168,4 +168,146 @@ TEST(Guid, PrefixRandomDistinct)
   EXPECT_NE(a, b);
 }
 
+TEST(FrameHeader, RejectsOlderProtocolVersion)
+{
+  mdds::Guid writer = make_test_guid(0x10);
+  auto frame = mdds::encode_data(writer, 1, 0, nullptr, 0);
+  frame[4] = 2;  // v2 frame on a v3 decoder
+  mdds::FrameHeader hdr{};
+  EXPECT_FALSE(mdds::decode_header(frame.data(), frame.size(), hdr));
+}
+
+TEST(DataFrame, ReliableFlagRoundtrip)
+{
+  mdds::Guid writer = make_test_guid(0x11);
+  const char payload[] = "x";
+  auto frame = mdds::encode_data(
+    writer, 1, 0, reinterpret_cast<const uint8_t *>(payload), 1, mdds::kFlagReliable);
+  mdds::FrameHeader hdr{};
+  ASSERT_TRUE(mdds::decode_header(frame.data(), frame.size(), hdr));
+  EXPECT_EQ(hdr.flags & mdds::kFlagReliable, mdds::kFlagReliable);
+}
+
+TEST(DataFrame, OriginTrailerRoundtrip)
+{
+  mdds::Guid writer = make_test_guid(0x12);
+  mdds::DataTrailer trailer;
+  trailer.has_origin = true;
+  trailer.origin_guid = make_test_guid(0x77);
+  trailer.origin_seq = 4242;
+  const char payload[] = "hello trailer";
+  auto frame = mdds::encode_data(
+    writer, 5, 100, reinterpret_cast<const uint8_t *>(payload), sizeof(payload),
+    mdds::kFlagReliable, &trailer);
+
+  mdds::DataBody body{};
+  ASSERT_TRUE(mdds::decode_data(frame.data(), frame.size(), body));
+  ASSERT_EQ(body.payload_len, sizeof(payload));
+  EXPECT_EQ(0, std::memcmp(body.payload, payload, sizeof(payload)));
+  EXPECT_TRUE(body.trailer.has_origin);
+  EXPECT_EQ(body.trailer.origin_guid, trailer.origin_guid);
+  EXPECT_EQ(body.trailer.origin_seq, 4242u);
+}
+
+TEST(DataFrame, NoTrailerDecodesEmpty)
+{
+  mdds::Guid writer = make_test_guid(0x13);
+  auto frame = mdds::encode_data(writer, 1, 0, nullptr, 0);
+  mdds::DataBody body{};
+  ASSERT_TRUE(mdds::decode_data(frame.data(), frame.size(), body));
+  EXPECT_FALSE(body.trailer.has_origin);
+}
+
+TEST(DataFrame, UnknownTlvEntrySkipped)
+{
+  mdds::Guid writer = make_test_guid(0x14);
+  auto frame = mdds::encode_data(writer, 1, 0, nullptr, 0);
+  // Append an unknown TLV entry (type 0xEE, len 3) to the body.
+  const uint32_t body_len = mdds::kDataBodyFixedSize + 5;
+  frame.resize(mdds::kHeaderSize + body_len);
+  frame[mdds::kHeaderSize + mdds::kDataBodyFixedSize + 0] = 0xEE;
+  frame[mdds::kHeaderSize + mdds::kDataBodyFixedSize + 1] = 3;
+  // fix up body_len in the header
+  frame[8] = static_cast<uint8_t>(body_len >> 24);
+  frame[9] = static_cast<uint8_t>(body_len >> 16);
+  frame[10] = static_cast<uint8_t>(body_len >> 8);
+  frame[11] = static_cast<uint8_t>(body_len & 0xff);
+
+  mdds::DataBody body{};
+  ASSERT_TRUE(mdds::decode_data(frame.data(), frame.size(), body));
+  EXPECT_EQ(body.payload_len, 0u);
+  EXPECT_FALSE(body.trailer.has_origin);
+}
+
+TEST(DataFrame, MalformedTrailerKeepsPayload)
+{
+  mdds::Guid writer = make_test_guid(0x15);
+  const char payload[] = "abc";
+  auto frame = mdds::encode_data(
+    writer, 1, 0, reinterpret_cast<const uint8_t *>(payload), sizeof(payload));
+  // Append a truncated TLV entry (declares len 10, only 1 byte present).
+  const uint32_t body_len = mdds::kDataBodyFixedSize + sizeof(payload) + 3;
+  frame.resize(mdds::kHeaderSize + body_len);
+  const size_t tail = mdds::kHeaderSize + mdds::kDataBodyFixedSize + sizeof(payload);
+  frame[tail + 0] = mdds::kTlvOriginGuid;
+  frame[tail + 1] = 10;
+  frame[tail + 2] = 0xAA;
+  frame[8] = static_cast<uint8_t>(body_len >> 24);
+  frame[9] = static_cast<uint8_t>(body_len >> 16);
+  frame[10] = static_cast<uint8_t>(body_len >> 8);
+  frame[11] = static_cast<uint8_t>(body_len & 0xff);
+
+  mdds::DataBody body{};
+  ASSERT_TRUE(mdds::decode_data(frame.data(), frame.size(), body));
+  ASSERT_EQ(body.payload_len, sizeof(payload));
+  EXPECT_EQ(0, std::memcmp(body.payload, payload, sizeof(payload)));
+  EXPECT_FALSE(body.trailer.has_origin);
+}
+
+TEST(DataFragFrame, OriginTrailerRoundtrip)
+{
+  mdds::Guid writer = make_test_guid(0x31);
+  mdds::DataTrailer trailer;
+  trailer.has_origin = true;
+  trailer.origin_guid = make_test_guid(0x88);
+  trailer.origin_seq = 7;
+  uint8_t chunk[64];
+  for (size_t i = 0; i < sizeof(chunk); ++i) {
+    chunk[i] = static_cast<uint8_t>(i);
+  }
+  auto frame = mdds::encode_data_frag(
+    writer, 9, 555, 6400, 1024, chunk, sizeof(chunk), mdds::kFlagReliable, &trailer);
+
+  mdds::DataFragBody body{};
+  ASSERT_TRUE(mdds::decode_data_frag(frame.data(), frame.size(), body));
+  EXPECT_EQ(body.writer, writer);
+  EXPECT_EQ(body.seq, 9u);
+  EXPECT_EQ(body.total_size, 6400u);
+  EXPECT_EQ(body.frag_offset, 1024u);
+  ASSERT_EQ(body.payload_len, sizeof(chunk));
+  EXPECT_TRUE(body.trailer.has_origin);
+  EXPECT_EQ(body.trailer.origin_guid, trailer.origin_guid);
+  EXPECT_EQ(body.trailer.origin_seq, 7u);
+}
+
+TEST(GapFrame, Roundtrip)
+{
+  mdds::Guid writer = make_test_guid(0x90);
+  auto frame = mdds::encode_gap(writer, 10, 42);
+
+  mdds::GapBody body{};
+  ASSERT_TRUE(mdds::decode_gap(frame.data(), frame.size(), body));
+  EXPECT_EQ(body.writer, writer);
+  EXPECT_EQ(body.gap_start, 10u);
+  EXPECT_EQ(body.gap_end, 42u);
+}
+
+TEST(GapFrame, RejectsWrongType)
+{
+  mdds::Guid writer = make_test_guid(0x91);
+  auto frame = mdds::encode_heartbeat(writer, 1, 2);
+  mdds::GapBody body{};
+  EXPECT_FALSE(mdds::decode_gap(frame.data(), frame.size(), body));
+}
+
 }  // namespace

@@ -23,7 +23,7 @@ namespace mdds
 std::vector<std::vector<uint8_t>> Fragmenter::fragment(
   const Guid & writer, uint64_t seq, uint64_t pub_time_ms,
   const uint8_t * payload, uint32_t payload_len,
-  size_t max_payload)
+  size_t max_payload, uint16_t flags)
 {
   std::vector<std::vector<uint8_t>> frames;
   if (payload_len > 0 && payload == nullptr) {
@@ -32,7 +32,7 @@ std::vector<std::vector<uint8_t>> Fragmenter::fragment(
 
   // Fits in a single DATA frame?
   if (kHeaderSize + kDataBodyFixedSize + payload_len <= max_payload) {
-    frames.push_back(encode_data(writer, seq, pub_time_ms, payload, payload_len));
+    frames.push_back(encode_data(writer, seq, pub_time_ms, payload, payload_len, flags));
     return frames;
   }
 
@@ -46,7 +46,8 @@ std::vector<std::vector<uint8_t>> Fragmenter::fragment(
   while (offset < payload_len) {
     const uint32_t chunk = std::min(frag_capacity, payload_len - offset);
     frames.push_back(
-      encode_data_frag(writer, seq, pub_time_ms, payload_len, offset, payload + offset, chunk));
+      encode_data_frag(
+        writer, seq, pub_time_ms, payload_len, offset, payload + offset, chunk, flags));
     offset += chunk;
   }
   return frames;
