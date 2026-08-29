@@ -36,6 +36,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -48,6 +49,23 @@
 #include "softbus_error_code.h"
 #include "token_setproc.h"
 
+#include "send_lane.hpp"
+
+// GetSessionOption is part of the session kit (session.h, exported by
+// libsoftbus_client) but is not in the trimmed third_party headers. The
+// Socket API reuses the session id space, so a bound socket fd is a valid
+// sessionId for this probe.
+extern "C" {
+
+typedef enum {
+  SESSION_OPTION_MAX_SENDBYTES_SIZE = 0,  // value type uint32_t, get-only
+} SessionOption;
+
+int32_t GetSessionOption(int32_t sessionId, SessionOption option, void * optionValue,
+  uint32_t valueSize);
+
+}  // extern "C"
+
 namespace mdds
 {
 
@@ -57,6 +75,10 @@ namespace
 constexpr const char * kPkgName = "com.kaihong.mdds";
 constexpr const char * kSessionPrefix = "com.kaihong.mdds.d";
 constexpr uint32_t kPeerPollMs = 2000;
+// Lane backpressure budgets (kaihong values): per-peer queue and one shared
+// ceiling across all peers of this transport.
+constexpr size_t kLaneByteBudget = 8 * 1024 * 1024;
+constexpr size_t kGlobalByteBudget = 32 * 1024 * 1024;
 
 class DsoftbusTransport : public Transport
 {
@@ -115,35 +137,61 @@ public:
     if (poll_thread_.joinable()) {
       poll_thread_.join();
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto & kv : peers_) {
-      if (kv.second.socket_fd >= 0) {
-        Shutdown(kv.second.socket_fd);
+    std::vector<std::shared_ptr<SendLane>> lanes;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (auto & kv : peers_) {
+        if (kv.second.socket_fd >= 0) {
+          Shutdown(kv.second.socket_fd);
+        }
+        if (kv.second.lane) {
+          lanes.push_back(std::move(kv.second.lane));
+        }
       }
+      peers_.clear();
+      if (listen_fd_ >= 0) {
+        Shutdown(listen_fd_);
+        listen_fd_ = -1;
+      }
+      s_instance = nullptr;
     }
-    peers_.clear();
-    if (listen_fd_ >= 0) {
-      Shutdown(listen_fd_);
-      listen_fd_ = -1;
+    // Shutdown first (above) unblocks any in-flight SendBytes, then join the
+    // lane workers outside mutex_.
+    for (auto & lane : lanes) {
+      lane->stop(false);
     }
-    s_instance = nullptr;
   }
 
   bool send(PeerId peer, const uint8_t * data, size_t len) override
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto & kv : peers_) {
-      if (kv.second.peer_id == peer && kv.second.socket_fd >= 0) {
-        return SendBytes(kv.second.socket_fd, data, static_cast<uint32_t>(len)) == SOFTBUS_OK;
+    // Never do IO here: callers include DSoftBus callback threads. Copy the
+    // lane under lock, then enqueue without holding mutex_.
+    std::shared_ptr<SendLane> lane;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (const auto & kv : peers_) {
+        if (kv.second.peer_id == peer && kv.second.lane) {
+          lane = kv.second.lane;
+          break;
+        }
       }
     }
-    return false;
+    if (!lane) {
+      return false;
+    }
+    // false here means "dropped by lane backpressure" — the same observable
+    // outcome as a network drop; reliable writers heal it via ACKNACK/GAP.
+    return lane->push(data, len);
   }
 
-  size_t max_payload(PeerId /*peer*/) const override
+  size_t max_payload(PeerId peer) const override
   {
-    // Conservative: works even on narrow Proxy/BR channels; the fragmenter
-    // handles the rest. GetSessionOption probing is a possible optimization.
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto & kv : peers_) {
+      if (kv.second.peer_id == peer) {
+        return kv.second.max_payload > 0 ? kv.second.max_payload : kDefaultMaxPayload;
+      }
+    }
     return kDefaultMaxPayload;
   }
 
@@ -183,6 +231,8 @@ private:
     int32_t socket_fd = -1;   // connected channel fd (incoming or outgoing)
     int32_t pending_fd = -1;  // outgoing socket still binding
     bool up_notified = false;
+    std::shared_ptr<SendLane> lane;    // alive while socket_fd is connected
+    size_t max_payload = 0;            // probed via GetSessionOption; 0 = default
   };
 
   static void setup_token()
@@ -314,6 +364,17 @@ private:
       if (st.socket_fd < 0) {
         st.socket_fd = fd;
         st.up_notified = true;
+        st.max_payload = probe_max_payload(fd);
+        // The lane owns all sends to this peer; it dies with the channel so
+        // the sink can capture fd. deliver() re-validates fd under mutex_
+        // right before SendBytes ("pin & touch"), so a stale lane never
+        // writes to a reassigned fd.
+        const PeerId pid = st.peer_id;
+        st.lane = std::make_shared<SendLane>(
+          [this, pid, fd](const uint8_t * data, size_t len) {
+            return deliver(pid, fd, data, len);
+          },
+          kLaneByteBudget, global_budget_);
         notify = true;
         peer_id = st.peer_id;
       } else if (st.socket_fd != fd) {
@@ -330,6 +391,7 @@ private:
   void on_shutdown(int32_t fd, ShutdownReason /*reason*/)
   {
     PeerId peer_id = kInvalidPeer;
+    std::shared_ptr<SendLane> dead_lane;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (fd == listen_fd_) {
@@ -341,6 +403,8 @@ private:
         PeerState & st = kv.second;
         if (st.socket_fd == fd) {
           st.socket_fd = -1;
+          st.max_payload = 0;
+          dead_lane = std::move(st.lane);
           if (st.up_notified) {
             st.up_notified = false;
             peer_id = st.peer_id;
@@ -350,9 +414,49 @@ private:
         }
       }
     }
+    // Join the worker outside mutex_: its in-flight deliver() needs mutex_.
+    if (dead_lane) {
+      dead_lane->stop(false);  // peer is gone; discard queued frames
+    }
     if (peer_id != kInvalidPeer) {
       listener_->on_peer_down(peer_id);
     }
+  }
+
+  /// Lane sink: re-validate that (peer, fd) is still the live channel, then
+  /// do the SendBytes IO without holding mutex_.
+  bool deliver(PeerId peer, int32_t fd, const uint8_t * data, size_t len)
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!running_) {
+        return false;
+      }
+      bool live = false;
+      for (const auto & kv : peers_) {
+        if (kv.second.peer_id == peer && kv.second.socket_fd == fd) {
+          live = true;
+          break;
+        }
+      }
+      if (!live) {
+        return false;
+      }
+    }
+    return SendBytes(fd, data, static_cast<uint32_t>(len)) == SOFTBUS_OK;
+  }
+
+  /// Real per-channel SendBytes limit; 0 when the probe fails (caller falls
+  /// back to kDefaultMaxPayload).
+  static size_t probe_max_payload(int32_t fd)
+  {
+    uint32_t limit = 0;
+    if (GetSessionOption(fd, SESSION_OPTION_MAX_SENDBYTES_SIZE, &limit, sizeof(limit)) !=
+      SOFTBUS_OK || limit == 0)
+    {
+      return 0;
+    }
+    return limit;
   }
 
   void on_bytes_received(int32_t fd, const void * data, uint32_t len)
@@ -394,9 +498,10 @@ private:
   std::mutex stop_mutex_;
   std::condition_variable stop_cv_;
 
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   std::map<std::string, PeerState> peers_;  // keyed by networkId
   PeerId next_peer_id_ = 1;
+  SendBudget global_budget_{kGlobalByteBudget};
 
   static const ISocketListener s_listener;
 };

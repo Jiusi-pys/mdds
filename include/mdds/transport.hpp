@@ -67,8 +67,13 @@ public:
   virtual bool start(const TransportConfig & config, TransportListener * listener) = 0;
   virtual void stop() = 0;
 
-  /// Queue/deliver one frame to a peer. Returns false on immediate failure
-  /// (unknown peer, frame larger than max_payload, connection down).
+  /// Hand one frame to a peer. Returns false on immediate failure: unknown
+  /// peer, connection down, or the backend's send queue is full (drop-new
+  /// backpressure — the same observable outcome as a network drop, so
+  /// reliable traffic heals it via ACKNACK/GAP). A true return means the
+  /// backend accepted the frame; actual delivery is asynchronous (the
+  /// DSoftBus backend drains per-peer send lanes on worker threads, so this
+  /// is safe to call from transport callbacks).
   virtual bool send(PeerId peer, const uint8_t * data, size_t len) = 0;
 
   /// Maximum frame size accepted for this peer.
