@@ -1,7 +1,8 @@
 # mdds 设计文档
 
-> 状态：v3（阶段四：精确 NACK/GAP 可靠性补全 + 发送 lane + QoS 预设；
-> 本版已逐条核对 src/ 现行实现并修正）
+> 状态：v4（join  entitlement 按 reader 出生时刻判定：ANNOUNCE 端点记录携带
+> `birth_us`，GAP 按 reader 寻址；修复「发现不对称窗口内写出的样本被误当
+> join 前历史永久扣押」的竞态。此前 v3：精确 NACK/GAP + 发送 lane + QoS 预设）
 >
 > mdds 是以 OpenHarmony DSoftBus 为跨设备传输基座的 ROS 2 中间件传输层。
 > DSoftBus 仅作为**透明 Bytes 字节管道**（Socket API，`DATA_TYPE_BYTES`），
@@ -18,7 +19,9 @@ mdds core           ros2/src/Jiusi-pys/mdds         — 平台无关：帧编解
     │                                                   QoS（reliability/history）、端点管理
     │  transport 抽象接口 (mdds::Transport)
     ├─ transport_dsoftbus   跨设备数据面（仅 OHOS，DSoftBus Socket Bytes）
-    └─ transport_udp        UDP loopback：主机单元测试 + 同机多进程互通
+    └─ transport_udp        UDP：主机单元测试 + 同机多进程互通；udp_cross_device
+                            开启时经接口广播发现跨设备 peer（IP 可达即可，如板间
+                            Ethernet 直连），每进程独立 (ipv4, port) 身份
 ```
 
 关键约束（来自 DSoftBus 源码事实）：
@@ -38,9 +41,10 @@ mdds core           ros2/src/Jiusi-pys/mdds         — 平台无关：帧编解
   （1 字节 kind：participant/writer/reader + 3 字节递增序号）。
   映射到 `rmw_gid_t`（24 字节数组，放 16 字节 GUID，其余清零），与 CycloneDDS 做法一致。
 - **对端标识**：transport 层用 `PeerId`（dsoftbus backend 为递增序号 `next_peer_id_`，
-  `peers_` map 以 networkId 字符串为 key 维护序号 ↔ socket fd 映射；udp backend 为对端
-  UDP 端口号，loopback 隐含 IP）。mdds core 只对 `PeerId`（uint64 不透明句柄）编程：
-  高 8 位为 transport index，低 56 位为 backend id（`participant.cpp:make_peer_id()`）。
+  `peers_` map 以 networkId 字符串为 key 维护序号 ↔ socket fd 映射；udp backend 为
+  `(ipv4 << 16) | port`，同机对端一律归一化为 127.0.0.1）。mdds core 只对
+  `PeerId`（uint64 不透明句柄）编程：高 8 位为 transport index，低 56 位为 backend id
+  （`participant.cpp:make_peer_id()`）。
 
 ## 3. 连接拓扑
 
@@ -49,7 +53,15 @@ mdds core           ros2/src/Jiusi-pys/mdds         — 平台无关：帧编解
   softbus_trans_permission.json 白名单，见 §9）；同时由轮询线程（`kPeerPollMs = 2000`）
   向 LNN 组网内每个在线 peer 的同名 socket 发起 `BindAsync`（失败由下轮轮询重试）。
 - 连接建立后双向收发，一 peer 一条 socket。`OnShutdown` → 视该 peer 下线，清除其全部远端端点。
-- 同设备多进程：`transport_udp`（127.0.0.1）承载，避免占用 socket 配额与同机 session 不确定性。
+- **DSoftBus session server 每设备每 (pkgName, sessionName) 只容许一个注册进程**
+  （`trans_session_manager.c:TransSessionServerAddItem`：同名异进程注册返回
+  `SOFTBUS_SERVER_NAME_USED`）。因此同机第二个 mdds 进程的 dsoftbus 后端 listen 失败、
+  静默降级为无跨板能力——同机多进程（含跨板可见性）由 `transport_udp` 兜底：
+  每进程占用端口段内一个独立 UDP 端口，经接口广播互发 presence（12 B 'PING' 报文，
+  `udp_announce_ms` 周期），来源地址即 peer 身份，无需任何集中注册。同机对端的
+  广播自收归一化回 127.0.0.1 peer 键，不产生双通道。两后端可并存：同一远端
+  participant 的 ANNOUNCE 经任一通道到达后按 `announce_seq` 去重，数据面固定走
+  首个到达通道，通道断开由下一次 ANNOUNCE 自动切换。
 - **发送 lane（dsoftbus 后端）**：每个已连接 peer 一条 `SendLane`（`src/send_lane.hpp`）——
   有界字节队列 + 专属 worker 线程。`Transport::send()` 只入队拷贝、立即返回，**绝不在
   DSoftBus 回调线程上做网络 IO**（OnBytes 回调里触发的 ACKNACK/重传同样只入队）。
@@ -59,19 +71,21 @@ mdds core           ros2/src/Jiusi-pys/mdds         — 平台无关：帧编解
   worker 做 `SendBytes` 前在锁内复核 (peer, fd) 仍为当前通道（pin & touch 的简化版），
   IO 本身不持锁。UDP loopback 后端保持同步 `sendto` 直发（本机内核管道，无慢对端风险）。
 
-## 4. 帧格式 v3
+## 4. 帧格式 v4
 
 所有多字节字段为网络字节序（big-endian）。一次 mdds 帧 = 一次 `SendBytes` 调用。
-v3 相对 v2 的变化：DATA / DATA_FRAG body 增加显式 `payload_len`，体尾可挂 TLV 扩展
+v4 相对 v3 的变化：ANNOUNCE 端点记录追加 `birth_us`（端点创建时刻，system_clock µs）；
+GAP body 追加 `reader_guid`（按 reader 寻址，不再全 participant 生效）。
+version 字段升为 4，v3/v4 不互通（延续以往立场；gateway 转发无需转换，帧体原样透传）。
+v3 相对 v2：DATA / DATA_FRAG body 增加显式 `payload_len`，体尾可挂 TLV 扩展
 （网关防环预留 originGuid/originSeq）；flags 启用 `kFlagReliable`；新增 GAP 帧。
-version 字段升为 3，v2/v3 不互通（延续 v1→v2 立场；gateway 转发无需转换，帧体原样透传）。
 
 公共头（12 B）：
 
 | 偏移 | 字段 | 说明 |
 |---|---|---|
 | 0 | char magic[4] | `"MDDS"` |
-| 4 | uint8 version | = 3 |
+| 4 | uint8 version | = 4 |
 | 5 | uint8 frame_type | 1=DATA, 2=DATA_FRAG, 3=ACKNACK, 4=HEARTBEAT, 5=ANNOUNCE, 6=GAP |
 | 6 | uint16 flags | bit0 `kFlagReliable`：来自 RELIABLE writer 的 DATA/DATA_FRAG（重传与首发同置） |
 | 8 | uint32 body_len | 帧头之后的 body 长度 |
@@ -101,12 +115,25 @@ bitmap 第 i 位表示 seq = base_seq + i **已收到**（精确 NACK，v3 起�
 reader 在数据到达时检出 reliable 配对的 seq 空洞（`deliver_sample` 立即发送），以及
 收到 HEARTBEAT 发现自身落后（`handle_heartbeat`，base = 自身基线 +1，bitmap = 接收窗口快照）。
 
-GAP body（32 B）：`writer_guid(16) | gap_start:uint64 | gap_end:uint64`（闭区间）。
-writer 在 ACKNACK 请求的 seq 已从历史缓存驱逐（`seq < first_avail`）时回复 GAP，
-宣告该区间**永不重传**；reader 的 `apply_gap` 把基线推过 gap_end，
-窗口已收位不算丢失，其余按丢失计一次（`messages_lost`），NACK 循环就此终止。
-writer 侧 volatile reader 的 join 水位线（`reader_join_seq_`）优先于 GAP 判定：
-join 之前的 seq 既不重传也不 GAP（晚加入的 volatile reader 不会拉取加入前的历史）。
+GAP body（48 B）：`writer_guid(16) | reader_guid(16) | gap_start:uint64 | gap_end:uint64`（闭区间）。
+writer 在 ACKNACK 请求的 seq 已从历史缓存驱逐（`seq < first_avail`）**或早于该 volatile
+reader 的出生时刻**时回复 GAP，宣告该区间**永不会发给这个 reader**；reader 的
+`apply_gap` 把基线推过 gap_end，窗口已收位不算丢失，其余按丢失计一次（`messages_lost`），
+NACK 循环就此终止。v4 起 GAP 按 `reader_guid` 寻址，只作用于发起 NACK 的那个 reader——
+同一 participant 内不同 reader 出生时刻不同，entitlement 各自独立。
+对尚无该 writer 接收状态的 reader，`apply_gap` 直接建立基线（`last_seq = gap_end`）且
+**不计丢失**——那些 seq 本就不是它有权获得的。
+
+volatile reader 的 join 判定用**出生时刻**（`birth_us`，随 ANNOUNCE 端点记录宣告）而非
+writer 侧的 seq 水位线：writer 把请求 seq 的 `pub_time_us < reader.birth_us` 判为 join 前
+历史（GAP 推基线），反之补发。这覆盖了「发现不对称」竞态：reader 出生后、writer 发现
+reader 之前写出的样本从未上线（无投递目标），reader 经 HEARTBEAT 检出后 NACK，
+writer 按出生时刻判定其有权获得并补发。毫秒分辨率不足以区分「reader 创建」与紧邻的
+一次 `write()`（同毫秒内两测试要求相反判定），故用 µs；跨设备时钟偏差只会把 join
+边界平移偏差量级（一次性、有界），与 lifespan 的时钟假设一致（已知限制）。
+尚未发现（announce 未到达）的 reader 发来的 ACKNACK 一律丢弃：出生时刻未知，
+任何重传都可能把 join 前历史泄漏给 volatile reader；该 reader 的 announce 到达后
+随下一次 HEARTBEAT 重新 ACKNACK，语义即正确。
 
 reader 接收窗口：每 writer 一个 64 位 bitmap 跟踪 `(last_seq, last_seq+64]` 的乱序到达；
 重复样本（含 apply_gap 滑窗后迟到的重传）按位去重；offset ≥ 64 的跳变直接计丢失并跳基线
@@ -128,7 +155,8 @@ ANNOUNCE body（**全量快照**，非增量；`src/discovery.cpp:encode_announc
 participant_guid(16) | announce_seq:uint64
 | node_count:uint16 | [ ns(string) + name(string) ] × node_count
 | endpoint_count:uint16
-| [ entity_guid(16) + kind:u8(1=writer,2=reader) + topic + type_name + qos(32 B) ] × endpoint_count
+| [ entity_guid(16) + kind:u8(1=writer,2=reader) + topic + type_name + qos(32 B)
+  + birth_us:uint64 ] × endpoint_count
 ```
 
 每次 ANNOUNCE 都携带本地全部节点与端点；没有 GONE 条目，节点/端点下线通过「从下一次
@@ -317,13 +345,24 @@ ros2/src/Jiusi-pys/mdds/
    64 KB 载荷（约 16 片/条）20/20 重组成功。构建 `./examples/build_e2e.sh`，
    部署 `/data/local/tmp/mdds_e2e/`（二进制 + libmdds.so + libc++_shared.so）。
 
-## 10. 已知限制（v3）
+## 10. 已知限制（v4）
 
 - 每进程最多 15 条 dsoftbus socket → 单进程可见跨设备 peer 数 ≤ ~14；dsoftbus
   transport 每进程单实例（`ISocketListener` 回调无 user data，经全局表分发）。
+- DSoftBus session server 每设备每 (pkgName, sessionName) 只允许一个注册进程
+  （mdds 共用 `com.kaihong.mdds.d<domain>`）→ 同板第二个进程的 dsoftbus 后端
+  Listen 失败被静默跳过，跨设备流量实际由 UDP 跨板路径承载（v4 起默认开启
+  `udp_cross_device`）。
+- 多路径冗余发送：同一对端主机经多个网段被发现时按源地址注册为多个 peer
+  （如 192.168.77.x 与 192.168.8.x 各一），每条跨板消息沿每条路径各发一份
+  （再叠加 dsoftbus 后端可达 3 份）；reader 端按 (writer, seq) 去重，正确性
+  不受影响，但广域/无线链路带宽被成倍占用。按主机身份合并 peer 留作后续优化。
 - 不支持多播；大规模节点拓扑未优化（全互联）。
 - lifespan 以 `pub_time_ms`（system_clock）判定，跨设备时钟不同步时过期判定按接收方
   时钟偏移。
+- volatile reader 的 join 判定比较 reader 出生时刻（`birth_us`）与样本 `pub_time_us`，
+  跨设备时钟偏差会把 join 边界平移偏差量级：偏差内晚加入的 reader 可能多收/少收
+  边界处样本（一次性、有界，稳态流不受影响）。
 - deadline/liveliness 事件为轮询合成，无后台定时线程。
 - writer history 的 KEEP_ALL 实为有限缓存（`kKeepAllCap = 256`），满时 `write()` 拒绝
   （背压显式上抛，不静默驱逐）。

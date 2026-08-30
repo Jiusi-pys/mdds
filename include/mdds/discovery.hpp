@@ -40,6 +40,13 @@ struct EndpointRecord
   std::string topic;
   std::string type_name;
   QosProfile qos;
+  /// system_clock microseconds at local endpoint creation. Remote reliable
+  /// writers compare it against cached samples' publication times to decide
+  /// what a volatile reader is entitled to: samples published before the
+  /// reader's birth are pre-join history (never delivered); samples published
+  /// after it must be (re)sent even if they were written before this writer
+  /// had discovered the reader.
+  uint64_t birth_us = 0;
 
   bool operator==(const EndpointRecord & o) const
   {

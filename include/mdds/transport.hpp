@@ -48,11 +48,17 @@ public:
 struct TransportConfig
 {
   uint32_t domain_id = 0;
-  // UDP loopback backend knobs (ignored by other backends).
+  // UDP backend knobs (ignored by other backends).
   uint16_t udp_base_port = 47811;   // first candidate listen port
   uint16_t udp_port_count = 32;     // ports scanned for bind + peer announce
   uint32_t udp_announce_ms = 500;   // presence announce period
   size_t udp_max_payload = 60000;   // advertised max frame size
+  // Also announce presence on the broadcast address of every non-loopback
+  // interface and accept datagrams from other hosts, turning the UDP backend
+  // into a cross-device transport for IP-reachable peers (e.g. boards linked
+  // by Ethernet). Same-host traffic keeps using loopback. Disable to restrict
+  // the backend to same-host unit-test/loopback duty.
+  bool udp_cross_device = true;
 };
 
 /// Byte-pipe transport abstraction. Implementations must deliver each send()
@@ -80,8 +86,10 @@ public:
   virtual size_t max_payload(PeerId peer) const = 0;
 };
 
-/// UDP loopback transport: same-host inter-process traffic and host unit
-/// tests. Cross-platform (Windows host, Linux, OHOS).
+/// UDP transport: same-host inter-process traffic over loopback, host unit
+/// tests, and — with udp_cross_device enabled — cross-device traffic toward
+/// IP-reachable peers (presence broadcast + unicast data). Cross-platform
+/// (Windows host, Linux, OHOS).
 std::unique_ptr<Transport> make_udp_loopback_transport();
 
 #ifdef MDDS_WITH_DSOFTBUS

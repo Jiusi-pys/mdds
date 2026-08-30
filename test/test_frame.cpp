@@ -293,11 +293,13 @@ TEST(DataFragFrame, OriginTrailerRoundtrip)
 TEST(GapFrame, Roundtrip)
 {
   mdds::Guid writer = make_test_guid(0x90);
-  auto frame = mdds::encode_gap(writer, 10, 42);
+  mdds::Guid reader = make_test_guid(0x91);
+  auto frame = mdds::encode_gap(writer, reader, 10, 42);
 
   mdds::GapBody body{};
   ASSERT_TRUE(mdds::decode_gap(frame.data(), frame.size(), body));
   EXPECT_EQ(body.writer, writer);
+  EXPECT_EQ(body.reader, reader);
   EXPECT_EQ(body.gap_start, 10u);
   EXPECT_EQ(body.gap_end, 42u);
 }

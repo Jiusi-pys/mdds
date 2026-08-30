@@ -334,14 +334,15 @@ bool decode_heartbeat(const uint8_t * buf, size_t len, HeartbeatBody & out)
 }
 
 std::vector<uint8_t> encode_gap(
-  const Guid & writer, uint64_t gap_start, uint64_t gap_end)
+  const Guid & writer, const Guid & reader, uint64_t gap_start, uint64_t gap_end)
 {
   std::vector<uint8_t> out(kHeaderSize + kGapBodySize);
   encode_header(out.data(), FrameType::GAP, 0, kGapBodySize);
   uint8_t * body = out.data() + kHeaderSize;
   put_guid(body, writer);
-  put_u64(body + 16, gap_start);
-  put_u64(body + 24, gap_end);
+  put_guid(body + 16, reader);
+  put_u64(body + 32, gap_start);
+  put_u64(body + 40, gap_end);
   return out;
 }
 
@@ -356,8 +357,9 @@ bool decode_gap(const uint8_t * buf, size_t len, GapBody & out)
   }
   const uint8_t * body = buf + kHeaderSize;
   get_guid(body, out.writer);
-  out.gap_start = get_u64(body + 16);
-  out.gap_end = get_u64(body + 24);
+  get_guid(body + 16, out.reader);
+  out.gap_start = get_u64(body + 32);
+  out.gap_end = get_u64(body + 40);
   return true;
 }
 

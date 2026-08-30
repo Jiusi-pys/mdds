@@ -48,6 +48,16 @@ uint64_t system_now_ms()
            std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
+/// Microsecond resolution: endpoint birth times and cached-sample publication
+/// times are compared to separate pre-join history from post-join samples.
+/// Milliseconds are too coarse — a reader's creation and the next write often
+/// land in the same millisecond on the same host.
+uint64_t system_now_us()
+{
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+           std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
 uint64_t steady_now_ms()
 {
   return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -103,6 +113,7 @@ public:
   ParticipantImpl * owner_ = nullptr;
   std::atomic<uint64_t> seq_{0};
   std::atomic<size_t> matched_count_{0};
+  uint64_t birth_us_ = 0;  // system_clock µs at create_writer(), announced
 
   // Writer history: recent samples for retransmission (reliable) and for
   // replay to late-joining readers (transient_local). Both paths share the
@@ -111,6 +122,7 @@ public:
   {
     uint64_t seq;
     uint64_t pub_time_ms;
+    uint64_t pub_time_us;  // same instant, µs resolution (join-entitlement)
     std::vector<uint8_t> data;
   };
   std::deque<CachedSample> history_;
@@ -119,7 +131,9 @@ public:
   /// Returns false when a KEEP_ALL history is already full: the sample is
   /// rejected (backpressure) instead of silently evicting the oldest entry,
   /// which would violate KEEP_ALL semantics.
-  bool cache_sample(uint64_t seq, uint64_t pub_time_ms, const uint8_t * data, size_t len)
+  bool cache_sample(
+    uint64_t seq, uint64_t pub_time_ms, uint64_t pub_time_us,
+    const uint8_t * data, size_t len)
   {
     if (qos_.reliability != Reliability::RELIABLE &&
       qos_.durability != Durability::TRANSIENT_LOCAL)
@@ -131,7 +145,8 @@ public:
     if (qos_.history == History::KEEP_ALL && history_.size() >= cap) {
       return false;
     }
-    history_.push_back(CachedSample{seq, pub_time_ms, std::vector<uint8_t>(data, data + len)});
+    history_.push_back(
+      CachedSample{seq, pub_time_ms, pub_time_us, std::vector<uint8_t>(data, data + len)});
     while (history_.size() > cap) {
       history_.pop_front();
     }
@@ -278,9 +293,11 @@ public:
     return {it->second.last_seq + 1, it->second.window};
   }
 
-  /// The writer declared [gap_start, gap_end] (inclusive) evicted forever.
-  /// Advance the baseline past the range, counting not-received seqs as lost
-  /// exactly once. Seqs already received (window bits) are not lost.
+  /// The writer declared [gap_start, gap_end] (inclusive) unavailable to this
+  /// reader forever: evicted from its history, or predating this volatile
+  /// reader's birth. Advance the baseline past the range, counting
+  /// not-received seqs as lost exactly once. Seqs already received (window
+  /// bits) are not lost.
   void apply_gap(const Guid & writer_guid, uint64_t gap_start, uint64_t gap_end)
   {
     // gap_start only bounds the writer's announcement; seqs <= last_seq are
@@ -289,7 +306,12 @@ public:
     std::lock_guard<std::mutex> lock(queue_mutex_);
     const auto it = rx_.find(writer_guid);
     if (it == rx_.end()) {
-      return;  // never received anything from this writer
+      // Nothing ever received from this writer: the GAP establishes the join
+      // baseline (the unavailable range is necessarily pre-join history from
+      // this reader's perspective). Not counted lost — the reader was never
+      // entitled to those seqs.
+      rx_[writer_guid] = WriterRxState{gap_end, 0};
+      return;
     }
     WriterRxState & st = it->second;
     if (gap_end <= st.last_seq) {
@@ -327,6 +349,7 @@ public:
   bool ignore_local_ = false;
   ParticipantImpl * owner_ = nullptr;
   std::atomic<size_t> matched_count_{0};
+  uint64_t birth_us_ = 0;  // system_clock µs at create_reader(), announced
 
   struct QueuedSample
   {
@@ -398,6 +421,7 @@ public:
     tc.udp_base_port = config_.udp_base_port;
     tc.udp_port_count = config_.udp_port_count;
     tc.udp_announce_ms = config_.udp_announce_ms;
+    tc.udp_cross_device = config_.udp_cross_device;
 
     if (config_.use_udp_loopback) {
       start_transport(make_udp_loopback_transport(), tc);
@@ -426,6 +450,7 @@ public:
     auto w = std::make_unique<WriterImpl>(topic, type_name, qos);
     w->guid_ = make_guid(prefix_, EntityKind::WRITER, ++entity_serial_);
     w->owner_ = this;
+    w->birth_us_ = system_now_us();
     WriterImpl * raw = w.get();
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -446,6 +471,7 @@ public:
     auto r = std::make_unique<ReaderImpl>(topic, type_name, qos, ignore_local);
     r->guid_ = make_guid(prefix_, EntityKind::READER, ++entity_serial_);
     r->owner_ = this;
+    r->birth_us_ = system_now_us();
     ReaderImpl * raw = r.get();
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -546,7 +572,8 @@ public:
   // ---- writer send path ----
   bool write_sample(WriterImpl * w, const uint8_t * data, size_t len)
   {
-    const uint64_t pub_time_ms = system_now_ms();
+    const uint64_t pub_time_us = system_now_us();
+    const uint64_t pub_time_ms = pub_time_us / 1000;
 
     std::vector<PeerId> targets;
     std::vector<ReaderImpl *> local_readers;
@@ -556,7 +583,7 @@ public:
       // Claim the sequence number under the lock so a rejected cache write
       // (KEEP_ALL backpressure) does not burn a seq and open a hole.
       seq = w->seq_.load() + 1;
-      if (!w->cache_sample(seq, pub_time_ms, data, len)) {
+      if (!w->cache_sample(seq, pub_time_ms, pub_time_us, data, len)) {
         return false;  // KEEP_ALL history full: rejected, nothing sent
       }
       w->seq_.store(seq);
@@ -639,9 +666,6 @@ public:
       reassemblers_.erase(peer);
       for (auto it = remote_.begin(); it != remote_.end(); ) {
         if (it->second.peer == peer) {
-          for (const auto & ep : it->second.snap.endpoints) {
-            reader_join_seq_.erase(ep.guid);
-          }
           it = remote_.erase(it);
           graph_changed = true;
         } else {
@@ -744,19 +768,6 @@ private:
           new_readers.push_back(ep);
         }
       }
-      // Join watermark: for each newly seen reader, remember the current high
-      // watermark of matching local writers. Volatile readers must never pull
-      // samples that predate their join (see handle_acknack clamp).
-      for (const auto & ep : new_readers) {
-        for (auto & kv : writers_) {
-          WriterImpl * w = kv.first;
-          if (ep.topic == w->topic_ && ep.type_name == w->type_ &&
-            qos_accepted_by_reader(ep.qos, w->qos_))
-          {
-            reader_join_seq_[ep.guid][w->guid_] = w->seq_.load();
-          }
-        }
-      }
       RemoteParticipant rp;
       rp.peer = peer;
       rp.announce_seq = seq;
@@ -781,7 +792,9 @@ private:
     std::vector<WriterImpl::CachedSample> resend;
     Guid writer_guid = body.writer;
     uint16_t flags = 0;
-    uint64_t gap_end = 0;  // highest requested seq already evicted from history
+    // Highest requested seq that will never be (re)sent to this reader:
+    // evicted from history, or predating a volatile reader's birth.
+    uint64_t unavail_end = 0;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       WriterImpl * w = find_writer_locked(writer_guid);
@@ -789,37 +802,44 @@ private:
         return;
       }
       flags = w->qos_.reliability == Reliability::RELIABLE ? kFlagReliable : 0;
-      // Volatile readers must not pull history from before their join: clamp
-      // resends to seqs above the recorded join watermark.
-      uint64_t join_floor = 0;
       const EndpointRecord * reader_ep = find_remote_endpoint_locked(body.reader);
-      if (reader_ep != nullptr && reader_ep->qos.durability == Durability::VOLATILE) {
-        auto rit = reader_join_seq_.find(body.reader);
-        if (rit != reader_join_seq_.end()) {
-          auto wit = rit->second.find(writer_guid);
-          if (wit != rit->second.end()) {
-            join_floor = wit->second;
-          }
-        }
+      if (reader_ep == nullptr) {
+        return;  // ACKNACK from a not-yet-discovered reader: without its
+                 // announced birth time we cannot tell its pre-join history
+                 // apart from samples it is entitled to, so any resend could
+                 // leak. It re-requests after its announce arrives.
       }
+      // A volatile reader must never receive samples that predate its
+      // creation, but IS entitled to samples published after its birth even
+      // when they were written before this writer discovered it (discovery
+      // is asymmetric: the reader may NACK a sample that never went on the
+      // wire). Publication time is monotone in seq per writer, so the
+      // pre-join set is a contiguous prefix.
+      const uint64_t reader_birth_us = reader_ep->birth_us;
+      const bool clamp_pre_join =
+        reader_ep->qos.durability == Durability::VOLATILE;
       // The history is contiguous: it holds [first_avail, latest published].
       const uint64_t first_avail =
         w->history_.empty() ? 0 : w->history_.front().seq;
       for (uint64_t i = 0; i < 64; ++i) {
         const uint64_t seq = body.base_seq + i;
-        if (body.bitmap & (1ULL << i) || seq <= join_floor) {
-          continue;  // already received, or predates the volatile reader's join
+        if (body.bitmap & (1ULL << i)) {
+          continue;  // already received
         }
         bool found = false;
         for (const auto & entry : w->history_) {
           if (entry.seq == seq) {
-            resend.push_back(entry);
+            if (clamp_pre_join && entry.pub_time_us < reader_birth_us) {
+              unavail_end = seq;  // pre-join history: never sent to this reader
+            } else {
+              resend.push_back(entry);
+            }
             found = true;
             break;
           }
         }
         if (!found && first_avail > 0 && seq < first_avail) {
-          gap_end = seq;  // evicted: will never be retransmitted, tell the reader
+          unavail_end = seq;  // evicted: will never be retransmitted
         }
       }
     }
@@ -828,18 +848,20 @@ private:
         peer, writer_guid, entry.seq, entry.pub_time_ms,
         entry.data.data(), entry.data.size(), flags);
     }
-    if (gap_end > 0) {
-      // GAP terminates the NACK loop for evicted seqs: the reader advances
-      // its baseline and counts them lost exactly once.
-      auto frame = encode_gap(writer_guid, body.base_seq, gap_end);
+    if (unavail_end > 0) {
+      // GAP terminates the NACK loop for seqs this reader will never get:
+      // it advances its baseline and counts them lost exactly once. The
+      // unavailable seqs form a prefix of [base_seq, ...], and the frame is
+      // addressed to the requesting reader only — entitlement differs per
+      // reader (each has its own birth time).
+      auto frame = encode_gap(writer_guid, body.reader, body.base_seq, unavail_end);
       send_frame(peer, frame.data(), frame.size());
     }
   }
 
-  /// GAP from a remote writer: [gap_start, gap_end] was evicted and will
-  /// never be retransmitted. Applied to every local reader that has state
-  /// for the writer (the endpoint match was validated when data was first
-  /// enqueued, so this stays correct while discovery is churning).
+  /// GAP from a remote writer: [gap_start, gap_end] will never be sent to the
+  /// addressed local reader. Applied only to that reader — other readers of
+  /// the same writer may be entitled to the range (their birth times differ).
   void handle_gap(PeerId peer, const uint8_t * data, size_t len)
   {
     static_cast<void>(peer);
@@ -848,8 +870,9 @@ private:
       return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto & kv : readers_) {
-      kv.first->apply_gap(body.writer, body.gap_start, body.gap_end);
+    ReaderImpl * r = find_reader_locked(body.reader);
+    if (r != nullptr) {
+      r->apply_gap(body.writer, body.gap_start, body.gap_end);
     }
   }
 
@@ -1135,12 +1158,12 @@ private:
     for (const auto & kv : writers_) {
       snap.endpoints.push_back(
         EndpointRecord{kv.first->guid_, EntityKind::WRITER, kv.first->topic_,
-          kv.first->type_, kv.first->qos_});
+          kv.first->type_, kv.first->qos_, kv.first->birth_us_});
     }
     for (const auto & kv : readers_) {
       snap.endpoints.push_back(
         EndpointRecord{kv.first->guid_, EntityKind::READER, kv.first->topic_,
-          kv.first->type_, kv.first->qos_});
+          kv.first->type_, kv.first->qos_, kv.first->birth_us_});
     }
     return snap;
   }
@@ -1149,6 +1172,17 @@ private:
   WriterImpl * find_writer_locked(const Guid & g)
   {
     for (auto & kv : writers_) {
+      if (kv.first->guid_ == g) {
+        return kv.first;
+      }
+    }
+    return nullptr;
+  }
+
+  /// Caller must hold mutex_.
+  ReaderImpl * find_reader_locked(const Guid & g)
+  {
+    for (auto & kv : readers_) {
       if (kv.first->guid_ == g) {
         return kv.first;
       }
@@ -1331,10 +1365,6 @@ private:
   /// steady_clock ms of the last DATA/HEARTBEAT received per remote writer
   /// (MANUAL_BY_TOPIC liveliness source).
   std::map<Guid, uint64_t> writer_last_seen_;
-  // reader guid -> (writer guid -> writer high watermark when the reader was
-  // first announced); used to keep volatile readers from pulling pre-join
-  // history via ACKNACK.
-  std::map<Guid, std::map<Guid, uint64_t>> reader_join_seq_;
   std::map<PeerId, Reassembler> reassemblers_;
   std::function<void()> graph_callback_;
   uint64_t announce_seq_ = 0;

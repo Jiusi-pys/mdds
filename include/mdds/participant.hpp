@@ -82,8 +82,13 @@ struct ParticipantConfig
   uint32_t domain_id = 0;
   bool use_udp_loopback = true;   // same-host inter-process + tests
   bool use_dsoftbus = true;       // cross-device (no-op when not built in)
+  // Let the UDP backend also announce on interface broadcast addresses and
+  // accept datagrams from other hosts (cross-device UDP). IP-reachable peers
+  // get every local process as a distinct peer — the DSoftBus backend admits
+  // only one process per device (single session-server registration).
+  bool udp_cross_device = true;
   uint32_t announce_period_ms = 2000;  // also the reliable-writer heartbeat period
-  // UDP loopback backend knobs (forwarded to TransportConfig).
+  // UDP backend knobs (forwarded to TransportConfig).
   uint16_t udp_base_port = 47811;
   uint16_t udp_port_count = 32;
   uint32_t udp_announce_ms = 500;

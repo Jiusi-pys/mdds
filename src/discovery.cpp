@@ -113,6 +113,7 @@ std::vector<uint8_t> encode_announce(const ParticipantSnapshot & snap, uint64_t 
     uint8_t qos_buf[kQosWireSize];
     encode_qos(qos_buf, e.qos);
     body.insert(body.end(), qos_buf, qos_buf + kQosWireSize);
+    put_u64(body, e.birth_us);
   }
 
   std::vector<uint8_t> frame(kHeaderSize + body.size());
@@ -175,6 +176,9 @@ bool decode_announce(
       return false;
     }
     if (!decode_qos(qos_buf, sizeof(qos_buf), e.qos)) {
+      return false;
+    }
+    if (!r.u64(e.birth_us)) {
       return false;
     }
     snap.endpoints.push_back(std::move(e));

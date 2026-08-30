@@ -24,9 +24,19 @@
 namespace mdds
 {
 
-/// Frame format v3 (see docs/design.md section 4). All multi-byte fields are
+/// Frame format v4 (see docs/design.md section 4). All multi-byte fields are
 /// big-endian. One mdds frame maps to exactly one Transport::send() call.
-/// v3 changes vs v2 (v3 does not interoperate with v2, same stance as v1->v2):
+/// v4 changes vs v3 (v4 does not interoperate with v3, same stance as before):
+///  - ANNOUNCE endpoint records carry birth_us (u64, system_clock microseconds
+///    at local endpoint creation). A reliable writer uses it to tell a
+///    volatile reader's pre-join history (never delivered) apart from samples
+///    published after the reader's birth but before discovery completed
+///    (must be retransmitted on NACK) — a distinction the writer cannot make
+///    from sequence numbers alone, because discovery is asymmetric.
+///  - GAP bodies carry the addressed reader's GUID. Entitlement to a gapped
+///    range differs per reader (each has its own birth time), so the frame is
+///    applied only to the reader that NACKed, not participant-wide.
+/// v3 changes vs v2:
 ///  - DATA / DATA_FRAG bodies carry an explicit payload_len (u32), so the body
 ///    may be followed by an optional TLV trailer; decoders skip unknown TLV
 ///    entry types, which lets the protocol evolve without a version bump.
@@ -48,7 +58,7 @@ enum class FrameType : uint8_t
   GAP = 6,
 };
 
-constexpr uint8_t kProtocolVersion = 3;
+constexpr uint8_t kProtocolVersion = 4;
 constexpr uint16_t kFlagReliable = 0x0001;
 
 constexpr size_t kHeaderSize = 12;
@@ -56,7 +66,7 @@ constexpr size_t kDataBodyFixedSize = 36;      // writer_guid(16) + seq(8) + pub
 constexpr size_t kDataFragBodyFixedSize = 44;  // + total_size(4) + frag_offset(4)
 constexpr size_t kAckNackBodySize = 48;        // reader(16) + writer(16) + base(8) + bitmap(8)
 constexpr size_t kHeartbeatBodySize = 32;      // writer(16) + first_seq(8) + last_seq(8)
-constexpr size_t kGapBodySize = 32;            // writer(16) + gap_start(8) + gap_end(8)
+constexpr size_t kGapBodySize = 48;            // writer(16) + reader(16) + gap_start(8) + gap_end(8)
 
 /// TLV trailer entry types (DATA / DATA_FRAG body tail).
 /// Entry encoding: type:u8 | len:u8 | value[len].
@@ -119,6 +129,7 @@ struct HeartbeatBody
 struct GapBody
 {
   Guid writer;
+  Guid reader;       // the NACKing reader this GAP answers
   uint64_t gap_start;  // inclusive
   uint64_t gap_end;    // inclusive
 };
@@ -163,10 +174,12 @@ std::vector<uint8_t> encode_heartbeat(
   const Guid & writer, uint64_t first_seq, uint64_t last_seq);
 bool decode_heartbeat(const uint8_t * buf, size_t len, HeartbeatBody & out);
 
-/// GAP: the writer has evicted [gap_start, gap_end] (inclusive) and will
-/// never retransmit them; readers advance their baseline past the range.
+/// GAP: the writer will never (re)send [gap_start, gap_end] (inclusive) to
+/// the addressed reader — the seqs were evicted from its history cache, or
+/// they predate a volatile reader's birth. That reader advances its baseline
+/// past the range; other local readers are unaffected.
 std::vector<uint8_t> encode_gap(
-  const Guid & writer, uint64_t gap_start, uint64_t gap_end);
+  const Guid & writer, const Guid & reader, uint64_t gap_start, uint64_t gap_end);
 bool decode_gap(const uint8_t * buf, size_t len, GapBody & out);
 
 }  // namespace mdds
